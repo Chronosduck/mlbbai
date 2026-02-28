@@ -61,9 +61,17 @@ async function scrapeHeroStats() {
   const seenIds   = new Set();
 
   try {
-    // Max page_size is 126 — fetch all in 2 passes
+    // The API uses POST with JSON body for pagination
+    // page_size max is 126, fetch page 1 and 2 to cover all 131 heroes
     for (let pageIndex = 1; pageIndex <= 2; pageIndex++) {
-      const raw  = await get(`/hero-rank/?page_size=126&page_index=${pageIndex}`);
+      const res = await axios.post(`${BASE}/hero-rank/`, {
+        page_size:   126,
+        page_index:  pageIndex,
+        sorts_field: 'main_heroid',
+        sorts_order: 'desc'
+      }, { headers: HEADERS, timeout: 15000 });
+
+      const raw  = res.data;
       const data = raw?.data || {};
       const rows = data.records || data.results || data.data || [];
 
