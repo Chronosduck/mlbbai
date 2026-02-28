@@ -34,10 +34,13 @@ function parseRankRow(row) {
   const banRate  = d.main_hero_ban_rate;
   const pickRate = d.main_hero_appearance_rate;
   const heroId   = d.main_heroid;
-  if (!heroId || winRate == null) return null;
+  const name     = heroData.name || null;
+
+  if (winRate == null) return null;
+
   return {
     heroId,
-    name:      heroData.name || null,
+    name,
     img:       heroData.head || heroData.image || '',
     winRate:   `${(winRate  * 100).toFixed(1)}%`,
     banRate:   banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
@@ -49,76 +52,74 @@ function parseRankRow(row) {
   };
 }
 
-// ─── Probe what params hero-rank accepts (run once) ───────────────────────────
-let probeDone = false;
-async function probeRankEndpoint(sampleId, sampleChannelId) {
-  if (probeDone) return;
-  probeDone = true;
+// ─── Fetch rank stats for ALL heroes using multiple strategies ────────────────
+async function fetchAllRankStats() {
+  const statsMap = {}; // keyed by heroId, also indexable by name
 
-  console.log('\n[PROBE] Testing hero-rank filter params...');
-
-  const tests = [
-    { label: 'main_heroid filter',       body: { main_heroid: sampleId } },
-    { label: 'heroid filter',            body: { heroid: sampleId } },
-    { label: 'hero_id filter',           body: { hero_id: sampleId } },
-    { label: 'channel_id filter',        body: { channel_id: sampleChannelId } },
-    { label: 'main_hero_channel filter', body: { main_hero_channel: sampleChannelId } },
-    { label: 'sorts by win_rate asc',    body: { sorts_field: 'main_hero_win_rate', sorts_order: 'asc' } },
-    { label: 'sorts by heroid asc',      body: { sorts_field: 'main_heroid', sorts_order: 'asc' } },
-    { label: 'sorts by heroid desc',     body: { sorts_field: 'main_heroid', sorts_order: 'desc' } },
-    { label: 'rank=legend',              body: { rank: 'legend' } },
-    { label: 'rank=mythic',              body: { rank: 'mythic' } },
-    { label: 'rank=epic',                body: { rank: 'epic' } },
-    { label: 'offset=20',                body: { offset: 20 } },
-    { label: 'skip=20',                  body: { skip: 20 } },
-    { label: 'start=20',                 body: { start: 20 } },
-    { label: 'from=20',                  body: { from: 20 } },
-    { label: 'cursor=20',                body: { cursor: 20 } },
+  // Strategy 1: try to get all heroes by requesting large page sizes
+  const attempts = [
+    { limit: 200 },
+    { limit: 150 },
+    { limit: 100 },
+    {},  // default
   ];
 
-  for (const t of tests) {
+  for (const body of attempts) {
     try {
-      const raw   = await post('/hero-rank/', t.body);
-      const rows  = raw?.data?.records || [];
-      const first = rows[0]?.data?.main_heroid;
-      const names = rows.slice(0,3).map(r => r?.data?.main_hero?.data?.name || r?.data?.main_heroid).join(', ');
-      console.log(`[PROBE] ${t.label}: ${rows.length} rows, first heroId=${first}, heroes: ${names}`);
-    } catch(e) {
-      console.log(`[PROBE] ${t.label}: ERROR ${e.message}`);
-    }
-    await new Promise(r => setTimeout(r, 100));
-  }
-
-  // Also check GET with query params
-  const getTests = [
-    '/hero-rank/?offset=20&limit=20',
-    '/hero-rank/?skip=20',
-    `/hero-rank/?main_heroid=${sampleId}`,
-    `/hero-rank/?heroid=${sampleId}`,
-    '/hero-rank/?page=2&page_size=20',
-    '/hero-rank/?sorts_field=main_heroid&sorts_order=asc',
-  ];
-
-  for (const path of getTests) {
-    try {
-      const raw  = await get(path);
+      const raw  = await post('/hero-rank/', body);
       const rows = raw?.data?.records || [];
-      const first = rows[0]?.data?.main_heroid;
-      console.log(`[PROBE] GET ${path}: ${rows.length} rows, first heroId=${first}`);
-    } catch(e) {
-      console.log(`[PROBE] GET ${path}: ERROR ${e.message}`);
+      console.log(`[API] hero-rank with ${JSON.stringify(body)}: ${rows.length} rows`);
+
+      for (const row of rows) {
+        const stats = parseRankRow(row);
+        if (!stats) continue;
+        if (stats.heroId) statsMap[`id:${stats.heroId}`] = stats;
+        if (stats.name)   statsMap[`name:${stats.name.toLowerCase()}`] = stats;
+      }
+
+      if (rows.length >= 100) break; // got a good batch, stop trying
+    } catch (e) {
+      console.warn(`[API] hero-rank attempt failed:`, e.message);
     }
-    await new Promise(r => setTimeout(r, 100));
   }
 
-  console.log('[PROBE] Done.\n');
+  // Strategy 2: try sorting variations to get different sets of heroes
+  const sortAttempts = [
+    { sorts_field: 'main_hero_win_rate', sorts_order: 'asc' },
+    { sorts_field: 'main_hero_win_rate', sorts_order: 'desc' },
+    { sorts_field: 'main_hero_ban_rate', sorts_order: 'desc' },
+    { sorts_field: 'main_hero_appearance_rate', sorts_order: 'desc' },
+  ];
+
+  for (const body of sortAttempts) {
+    try {
+      const raw  = await post('/hero-rank/', body);
+      const rows = raw?.data?.records || [];
+      let newEntries = 0;
+      for (const row of rows) {
+        const stats = parseRankRow(row);
+        if (!stats) continue;
+        const idKey   = `id:${stats.heroId}`;
+        const nameKey = `name:${stats.name?.toLowerCase()}`;
+        if (!statsMap[idKey] && !statsMap[nameKey]) newEntries++;
+        if (stats.heroId) statsMap[idKey]   = stats;
+        if (stats.name)   statsMap[nameKey] = stats;
+      }
+      if (newEntries > 0) console.log(`[API] Sort ${body.sorts_field} ${body.sorts_order}: +${newEntries} new heroes`);
+    } catch (e) {
+      console.warn(`[API] sort attempt failed:`, e.message);
+    }
+  }
+
+  console.log(`[API] Total unique rank entries collected: ${Object.keys(statsMap).length / 2 | 0}`);
+  return statsMap;
 }
 
 // ─── Main scrape ──────────────────────────────────────────────────────────────
 async function scrapeHeroStats() {
   console.log('[API] Fetching full hero roster from /hero-list/...');
 
-  const heroMap = {};
+  const heroMap = {}; // keyed by heroId
 
   // Step 1: full roster from hero-list
   try {
@@ -130,46 +131,55 @@ async function scrapeHeroStats() {
       const d      = row.data || row;
       const hd     = d.hero?.data || {};
       const name   = hd.name;
-      const heroId = d.hero_id;
-      if (!name || !heroId) continue;
+      const heroId = d.hero_id || d.heroid || d.id;
+      if (!name) continue;
 
-      heroMap[heroId] = {
+      // Use name as key if heroId is missing/unreliable
+      const key = heroId || `name:${name.toLowerCase()}`;
+      heroMap[key] = {
         name,
         role:      hd.role || hd.type || hd.hero_type || '—',
         winRate:   '—', banRate: '—', pickRate: '—',
         tier:      'Unranked',
         img:       hd.head || hd.image || hd.icon || '',
-        heroId,
+        heroId:    heroId || null,
         _winRate: 0, _banRate: 0, _pickRate: 0,
       };
     }
-    console.log(`[API] Parsed ${Object.keys(heroMap).length} heroes`);
+    console.log(`[API] Parsed ${Object.keys(heroMap).length} heroes from roster`);
   } catch (e) {
     console.error('[API] hero-list error:', e.message);
   }
 
-  // Step 2: get default top-20 rank stats
-  try {
-    const raw  = await post('/hero-rank/', {});
-    const rows = raw?.data?.records || [];
-    let overlaid = 0;
+  // Step 2: get rank stats for all heroes
+  console.log(`[API] Fetching rank stats for ${Object.keys(heroMap).length} heroes...`);
+  const statsMap = await fetchAllRankStats();
 
-    // Run probe using first hero's data
-    if (rows[0]) {
-      const d = rows[0].data || rows[0];
-      await probeRankEndpoint(d.main_heroid, d.main_hero_channel?.id);
+  // Step 3: merge — try heroId first, then name match
+  let merged = 0;
+  for (const [key, hero] of Object.entries(heroMap)) {
+    // Try by heroId
+    let stats = hero.heroId ? statsMap[`id:${hero.heroId}`] : null;
+
+    // Fallback: match by name
+    if (!stats && hero.name) {
+      stats = statsMap[`name:${hero.name.toLowerCase()}`];
     }
 
-    for (const row of rows) {
-      const stats = parseRankRow(row);
-      if (!stats?.heroId || !heroMap[stats.heroId]) continue;
-      Object.assign(heroMap[stats.heroId], stats);
-      overlaid++;
+    if (stats) {
+      hero.winRate  = stats.winRate;
+      hero.banRate  = stats.banRate;
+      hero.pickRate = stats.pickRate;
+      hero.tier     = stats.tier;
+      hero._winRate  = stats._winRate;
+      hero._banRate  = stats._banRate;
+      hero._pickRate = stats._pickRate;
+      if (stats.img && !hero.img) hero.img = stats.img;
+      merged++;
     }
-    console.log(`[API] Overlaid stats for ${overlaid} heroes from default rank`);
-  } catch (e) {
-    console.error('[API] hero-rank error:', e.message);
   }
+
+  console.log(`[API] Merged stats for ${merged}/${Object.keys(heroMap).length} heroes`);
 
   const heroes = Object.values(heroMap);
   console.log(`[API] Total heroes: ${heroes.length}`);
