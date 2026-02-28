@@ -27,7 +27,6 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
-// Parse a hero-rank record into stats object
 function parseRankRow(row) {
   const d        = row.data || row;
   const heroData = d.main_hero?.data || {};
@@ -35,12 +34,12 @@ function parseRankRow(row) {
   const banRate  = d.main_hero_ban_rate;
   const pickRate = d.main_hero_appearance_rate;
   const heroId   = d.main_heroid;
-  if (!heroId) return null;
+  if (!heroId || winRate == null) return null;
   return {
     heroId,
     name:      heroData.name || null,
     img:       heroData.head || heroData.image || '',
-    winRate:   winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
+    winRate:   `${(winRate  * 100).toFixed(1)}%`,
     banRate:   banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
     pickRate:  pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
     tier:      tierFromWinRate(winRate),
@@ -50,55 +49,78 @@ function parseRankRow(row) {
   };
 }
 
-// ─── Fetch stats for ALL heroes ───────────────────────────────────────────────
-// The /hero-rank/ endpoint only returns 20 at a time, but accepts a
-// "main_heroid" filter to get stats for a specific hero.
-// We fetch all 131 hero IDs from /hero-list/, then query /hero-rank/
-// for each hero individually in batches.
-async function fetchAllHeroStats(heroIds) {
-  const statsMap = {};
-  const BATCH = 10; // parallel requests per batch
-  let fetched = 0;
+// ─── Probe what params hero-rank accepts (run once) ───────────────────────────
+let probeDone = false;
+async function probeRankEndpoint(sampleId, sampleChannelId) {
+  if (probeDone) return;
+  probeDone = true;
 
-  console.log(`[API] Fetching rank stats for ${heroIds.length} heroes...`);
+  console.log('\n[PROBE] Testing hero-rank filter params...');
 
-  for (let i = 0; i < heroIds.length; i += BATCH) {
-    const batch = heroIds.slice(i, i + BATCH);
+  const tests = [
+    { label: 'main_heroid filter',       body: { main_heroid: sampleId } },
+    { label: 'heroid filter',            body: { heroid: sampleId } },
+    { label: 'hero_id filter',           body: { hero_id: sampleId } },
+    { label: 'channel_id filter',        body: { channel_id: sampleChannelId } },
+    { label: 'main_hero_channel filter', body: { main_hero_channel: sampleChannelId } },
+    { label: 'sorts by win_rate asc',    body: { sorts_field: 'main_hero_win_rate', sorts_order: 'asc' } },
+    { label: 'sorts by heroid asc',      body: { sorts_field: 'main_heroid', sorts_order: 'asc' } },
+    { label: 'sorts by heroid desc',     body: { sorts_field: 'main_heroid', sorts_order: 'desc' } },
+    { label: 'rank=legend',              body: { rank: 'legend' } },
+    { label: 'rank=mythic',              body: { rank: 'mythic' } },
+    { label: 'rank=epic',                body: { rank: 'epic' } },
+    { label: 'offset=20',                body: { offset: 20 } },
+    { label: 'skip=20',                  body: { skip: 20 } },
+    { label: 'start=20',                 body: { start: 20 } },
+    { label: 'from=20',                  body: { from: 20 } },
+    { label: 'cursor=20',                body: { cursor: 20 } },
+  ];
 
-    const results = await Promise.allSettled(
-      batch.map(id => post('/hero-rank/', { main_heroid: id }))
-    );
-
-    for (let j = 0; j < results.length; j++) {
-      const r = results[j];
-      if (r.status !== 'fulfilled') continue;
-
-      const rows = r.value?.data?.records || [];
-      for (const row of rows) {
-        const stats = parseRankRow(row);
-        if (stats?.heroId) {
-          statsMap[stats.heroId] = stats;
-          fetched++;
-          break; // only need first match per hero
-        }
-      }
+  for (const t of tests) {
+    try {
+      const raw   = await post('/hero-rank/', t.body);
+      const rows  = raw?.data?.records || [];
+      const first = rows[0]?.data?.main_heroid;
+      const names = rows.slice(0,3).map(r => r?.data?.main_hero?.data?.name || r?.data?.main_heroid).join(', ');
+      console.log(`[PROBE] ${t.label}: ${rows.length} rows, first heroId=${first}, heroes: ${names}`);
+    } catch(e) {
+      console.log(`[PROBE] ${t.label}: ERROR ${e.message}`);
     }
-
-    // Small delay between batches to be respectful
-    if (i + BATCH < heroIds.length) await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 100));
   }
 
-  console.log(`[API] Got rank stats for ${fetched}/${heroIds.length} heroes`);
-  return statsMap;
+  // Also check GET with query params
+  const getTests = [
+    '/hero-rank/?offset=20&limit=20',
+    '/hero-rank/?skip=20',
+    `/hero-rank/?main_heroid=${sampleId}`,
+    `/hero-rank/?heroid=${sampleId}`,
+    '/hero-rank/?page=2&page_size=20',
+    '/hero-rank/?sorts_field=main_heroid&sorts_order=asc',
+  ];
+
+  for (const path of getTests) {
+    try {
+      const raw  = await get(path);
+      const rows = raw?.data?.records || [];
+      const first = rows[0]?.data?.main_heroid;
+      console.log(`[PROBE] GET ${path}: ${rows.length} rows, first heroId=${first}`);
+    } catch(e) {
+      console.log(`[PROBE] GET ${path}: ERROR ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  console.log('[PROBE] Done.\n');
 }
 
-// ─── Main hero stats fetch ────────────────────────────────────────────────────
+// ─── Main scrape ──────────────────────────────────────────────────────────────
 async function scrapeHeroStats() {
   console.log('[API] Fetching full hero roster from /hero-list/...');
 
-  // Step 1: get complete roster from /hero-list/
   const heroMap = {};
 
+  // Step 1: full roster from hero-list
   try {
     const raw  = await get('/hero-list/');
     const rows = raw?.data?.records || [];
@@ -114,44 +136,40 @@ async function scrapeHeroStats() {
       heroMap[heroId] = {
         name,
         role:      hd.role || hd.type || hd.hero_type || '—',
-        winRate:   '—',
-        banRate:   '—',
-        pickRate:  '—',
+        winRate:   '—', banRate: '—', pickRate: '—',
         tier:      'Unranked',
         img:       hd.head || hd.image || hd.icon || '',
         heroId,
-        _winRate:  0,
-        _banRate:  0,
-        _pickRate: 0,
+        _winRate: 0, _banRate: 0, _pickRate: 0,
       };
     }
-    console.log(`[API] Parsed ${Object.keys(heroMap).length} heroes from roster`);
+    console.log(`[API] Parsed ${Object.keys(heroMap).length} heroes`);
   } catch (e) {
     console.error('[API] hero-list error:', e.message);
   }
 
-  // Step 2: fetch rank stats for every hero individually
-  const heroIds = Object.keys(heroMap).map(Number);
-  const statsMap = await fetchAllHeroStats(heroIds);
+  // Step 2: get default top-20 rank stats
+  try {
+    const raw  = await post('/hero-rank/', {});
+    const rows = raw?.data?.records || [];
+    let overlaid = 0;
 
-  // Step 3: merge stats into hero map
-  let merged = 0;
-  for (const [heroId, stats] of Object.entries(statsMap)) {
-    const id = Number(heroId);
-    if (!heroMap[id]) continue;
-    heroMap[id].winRate  = stats.winRate;
-    heroMap[id].banRate  = stats.banRate;
-    heroMap[id].pickRate = stats.pickRate;
-    heroMap[id].tier     = stats.tier;
-    heroMap[id]._winRate  = stats._winRate;
-    heroMap[id]._banRate  = stats._banRate;
-    heroMap[id]._pickRate = stats._pickRate;
-    // Use rank image if hero-list image is missing
-    if (!heroMap[id].img && stats.img) heroMap[id].img = stats.img;
-    merged++;
+    // Run probe using first hero's data
+    if (rows[0]) {
+      const d = rows[0].data || rows[0];
+      await probeRankEndpoint(d.main_heroid, d.main_hero_channel?.id);
+    }
+
+    for (const row of rows) {
+      const stats = parseRankRow(row);
+      if (!stats?.heroId || !heroMap[stats.heroId]) continue;
+      Object.assign(heroMap[stats.heroId], stats);
+      overlaid++;
+    }
+    console.log(`[API] Overlaid stats for ${overlaid} heroes from default rank`);
+  } catch (e) {
+    console.error('[API] hero-rank error:', e.message);
   }
-
-  console.log(`[API] Merged stats for ${merged}/${Object.keys(heroMap).length} heroes`);
 
   const heroes = Object.values(heroMap);
   console.log(`[API] Total heroes: ${heroes.length}`);
@@ -167,7 +185,6 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
   if (!heroId) { console.warn(`[API] No heroId for: ${heroIdOrSlug}`); return {}; }
 
-  console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
     const [detailRaw, counters, compatibility] = await Promise.allSettled([
       get(`/hero-detail/${heroId}/`),
@@ -199,20 +216,18 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
     } catch {}
 
     const ability = heroAttr.abilityshow || [];
-    const stats = {
-      durability: parseInt(ability[0]) || heroAttr.durability || 0,
-      offense:    parseInt(ability[1]) || heroAttr.offense    || 0,
-      control:    parseInt(ability[2]) || heroAttr.control    || 0,
-      mobility:   parseInt(ability[3]) || heroAttr.mobility   || 0,
-      support:    parseInt(ability[4]) || heroAttr.support    || 0,
-    };
-
     return {
       name:        heroAttr.name || detailData.name || String(heroId),
       role:        heroAttr.role || heroAttr.type   || heroAttr.hero_type || '—',
       description: heroAttr.story || heroAttr.lore  || heroAttr.description || '',
       img:         detailData.head_big || detailData.head || heroAttr.head || '',
-      stats,
+      stats: {
+        durability: parseInt(ability[0]) || heroAttr.durability || 0,
+        offense:    parseInt(ability[1]) || heroAttr.offense    || 0,
+        control:    parseInt(ability[2]) || heroAttr.control    || 0,
+        mobility:   parseInt(ability[3]) || heroAttr.mobility   || 0,
+        support:    parseInt(ability[4]) || heroAttr.support    || 0,
+      },
       build,
       counters:  (findArr(c)    || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
       teammates: (findArr(comp) || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
@@ -223,7 +238,6 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
 }
 
-// ─── Tier List & Leaderboard ──────────────────────────────────────────────────
 async function scrapeTierList() {
   const heroes = await scrapeHeroStats();
   const tiers  = {};
