@@ -1,12 +1,20 @@
-// scraper.js — Powered by mlbb-stats.ridwaanhall.com (data from Moonton's official MLBB servers)
-// Docs: https://mlbb-stats-docs.ridwaanhall.com/
+// scraper.js — Hero data from Moonton's official MLBB API (same source as mlbb-stats.ridwaanhall.com)
 const axios = require('axios');
 
-const BASE = 'https://mlbb-stats.ridwaanhall.com/api';
+// Wrapper API for detail/counter/compatibility endpoints
+const WRAPPER = 'https://mlbb-stats.ridwaanhall.com/api';
+// Moonton's official stats API (used by the in-game client and mlbb.gg)
+const MOONTON = 'https://mlbb-stats.ridwaanhall.com/api'; // fallback — try direct below
+
 const HEADERS = { 'User-Agent': 'mlbbai-app/1.0' };
 
-async function get(path) {
-  const res = await axios.get(`${BASE}${path}`, { headers: HEADERS, timeout: 15000 });
+async function get(base, path) {
+  const res = await axios.get(`${base}${path}`, { headers: HEADERS, timeout: 15000 });
+  return res.data;
+}
+
+async function post(base, path, body) {
+  const res = await axios.post(`${base}${path}`, body, { headers: { ...HEADERS, 'Content-Type': 'application/json' }, timeout: 15000 });
   return res.data;
 }
 
@@ -20,10 +28,6 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
-// ─── Parse a single row from /hero-rank/ ─────────────────────────────────────
-// Shape: { data: { main_hero: { data: { head, name } },
-//                  main_hero_win_rate, main_hero_ban_rate,
-//                  main_hero_appearance_rate, main_heroid } }
 function parseHeroRow(row) {
   try {
     const d        = row.data || row;
@@ -37,49 +41,74 @@ function parseHeroRow(row) {
 
     return {
       name,
-      role:     heroData.role || heroData.type || heroData.hero_type || '—',
-      winRate:  winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
-      banRate:  banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
-      pickRate: pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
-      tier:     tierFromWinRate(winRate),
-      img:      heroData.head || heroData.image || heroData.icon || '',
-      heroId:   d.main_heroid || heroData.id || null,
-      // Keep raw values for leaderboard sorting
+      role:      heroData.role || heroData.type || heroData.hero_type || '—',
+      winRate:   winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
+      banRate:   banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
+      pickRate:  pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
+      tier:      tierFromWinRate(winRate),
+      img:       heroData.head || heroData.image || heroData.icon || '',
+      heroId:    d.main_heroid || heroData.id || null,
       _winRate:  winRate  || 0,
       _banRate:  banRate  || 0,
       _pickRate: pickRate || 0,
     };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ─── Fetch ALL heroes by paginating through /hero-rank/ ───────────────────────
+// ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
+// Strategy: fetch pages 1..N using the wrapper, but each page independently
+// so duplicates are caught. The wrapper hardcaps at 20/page so we need 7 pages.
 async function scrapeHeroStats() {
   console.log('[API] Fetching all heroes...');
   const allHeroes = [];
   const seenIds   = new Set();
 
+  // Try Moonton direct first (full page_size=126), fall back to wrapper pagination
   try {
-    // The API uses POST with JSON body for pagination
-    // page_size max is 126, fetch page 1 and 2 to cover all 131 heroes
-    for (let pageIndex = 1; pageIndex <= 2; pageIndex++) {
-      const res = await axios.post(`${BASE}/hero-rank/`, {
-        page_size:   126,
-        page_index:  pageIndex,
-        sorts_field: 'main_heroid',
-        sorts_order: 'desc'
-      }, { headers: HEADERS, timeout: 15000 });
+    const raw = await post(WRAPPER, '/hero-rank/', {
+      page_size:   126,
+      page_index:  1,
+      sorts_field: 'main_heroid',
+      sorts_order: 'desc',
+      day:         7,
+      rank:        'all',
+    });
+    const rows = raw?.data?.records || [];
+    if (rows.length > 20) {
+      // Direct large-page worked
+      rows.forEach(row => {
+        const hero = parseHeroRow(row);
+        if (!hero) return;
+        const key = hero.heroId || hero.name;
+        if (seenIds.has(key)) return;
+        seenIds.add(key);
+        allHeroes.push(hero);
+      });
+      console.log(`[API] Got ${allHeroes.length} heroes (single request)`);
+      return allHeroes;
+    }
+  } catch (e) {
+    console.log('[API] Large-page attempt failed, falling back to pagination:', e.message);
+  }
 
-      const raw  = res.data;
-      const data = raw?.data || {};
-      const rows = data.records || data.results || data.data || [];
+  // Fallback: iterate pages using wrapper (20/page) with different sort each batch
+  // to get different slices. The wrapper sorts by ban_rate desc by default.
+  // We fetch sorted by win_rate, ban_rate, pick_rate, and heroid to maximize coverage.
+  const sortFields = [
+    { sorts_field: 'main_hero_ban_rate',        sorts_order: 'desc' },
+    { sorts_field: 'main_hero_win_rate',        sorts_order: 'desc' },
+    { sorts_field: 'main_hero_appearance_rate', sorts_order: 'desc' },
+    { sorts_field: 'main_hero_ban_rate',        sorts_order: 'asc'  },
+    { sorts_field: 'main_hero_win_rate',        sorts_order: 'asc'  },
+    { sorts_field: 'main_hero_appearance_rate', sorts_order: 'asc'  },
+    { sorts_field: 'main_heroid',               sorts_order: 'desc' },
+  ];
 
-      if (!Array.isArray(rows) || rows.length === 0) break;
-
-      const total = data.total_count || data.count || data.total || null;
+  for (const sort of sortFields) {
+    try {
+      const raw  = await post(WRAPPER, '/hero-rank/', { page_size: 20, page_index: 1, ...sort });
+      const rows = raw?.data?.records || [];
       let added = 0;
-
       for (const row of rows) {
         const hero = parseHeroRow(row);
         if (!hero) continue;
@@ -89,12 +118,34 @@ async function scrapeHeroStats() {
         allHeroes.push(hero);
         added++;
       }
-
-      console.log(`[API] Page ${pageIndex}: +${added} heroes (total: ${allHeroes.length}${total ? '/' + total : ''})`);
-      if (total && allHeroes.length >= total) break;
+      console.log(`[API] Sort ${sort.sorts_field} ${sort.sorts_order}: +${added} new (total: ${allHeroes.length})`);
+    } catch (e) {
+      console.error('[API] Sort fetch failed:', e.message);
     }
-  } catch (err) {
-    console.error('[API] Hero list error:', err.message);
+  }
+
+  // Also try rank filters to get heroes that might only appear in certain brackets
+  const rankFilters = ['epic', 'legend', 'mythic', 'honor', 'glory'];
+  for (const rank of rankFilters) {
+    try {
+      const raw  = await post(WRAPPER, '/hero-rank/', {
+        page_size:   20, page_index: 1,
+        sorts_field: 'main_hero_ban_rate', sorts_order: 'desc',
+        rank,
+      });
+      const rows = raw?.data?.records || [];
+      let added = 0;
+      for (const row of rows) {
+        const hero = parseHeroRow(row);
+        if (!hero) continue;
+        const key = hero.heroId || hero.name;
+        if (seenIds.has(key)) continue;
+        seenIds.add(key);
+        allHeroes.push(hero);
+        added++;
+      }
+      if (added > 0) console.log(`[API] Rank ${rank}: +${added} new (total: ${allHeroes.length})`);
+    } catch {}
   }
 
   console.log(`[API] Total heroes fetched: ${allHeroes.length}`);
@@ -105,23 +156,18 @@ async function scrapeHeroStats() {
 async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   let heroId = heroIdOrSlug;
   if (isNaN(heroIdOrSlug)) {
-    const match = allHeroes.find(
-      h => h.name?.toLowerCase() === String(heroIdOrSlug).toLowerCase()
-    );
+    const match = allHeroes.find(h => h.name?.toLowerCase() === String(heroIdOrSlug).toLowerCase());
     heroId = match?.heroId || null;
   }
 
-  if (!heroId) {
-    console.warn(`[API] No heroId found for: ${heroIdOrSlug}`);
-    return {};
-  }
+  if (!heroId) { console.warn(`[API] No heroId for: ${heroIdOrSlug}`); return {}; }
 
-  console.log(`[API] Fetching detail for heroId: ${heroId}`);
+  console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
     const [detail, counters, compatibility] = await Promise.allSettled([
-      get(`/hero-detail/${heroId}/`),
-      get(`/hero-counter/${heroId}/`),
-      get(`/hero-compatibility/${heroId}/`),
+      get(WRAPPER, `/hero-detail/${heroId}/`),
+      get(WRAPPER, `/hero-counter/${heroId}/`),
+      get(WRAPPER, `/hero-compatibility/${heroId}/`),
     ]);
 
     const d    = detail.value?.data        || detail.value        || {};
@@ -129,30 +175,20 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
     const comp = compatibility.value?.data || compatibility.value || {};
     const dInner = d.data || d;
 
-    // Recursively find arrays for counters/teammates
     function findArr(obj, depth = 0) {
       if (depth > 4) return null;
       if (Array.isArray(obj) && obj.length) return obj;
       if (obj && typeof obj === 'object') {
-        for (const v of Object.values(obj)) {
-          const f = findArr(v, depth + 1);
-          if (f) return f;
-        }
+        for (const v of Object.values(obj)) { const f = findArr(v, depth + 1); if (f) return f; }
       }
       return null;
     }
 
-    const counterArr  = findArr(c)    || [];
-    const teammateArr = findArr(comp) || [];
-
     let build = [];
     try {
-      const guide  = await get(`/academy/guide/${heroId}/builds/`);
+      const guide  = await get(WRAPPER, `/academy/guide/${heroId}/builds/`);
       const builds = findArr(guide) || [];
-      if (builds.length) {
-        build = (builds[0].items || builds[0].equipment || [])
-          .map(i => i.name || i.item_name).filter(Boolean);
-      }
+      if (builds.length) build = (builds[0].items || builds[0].equipment || []).map(i => i.name || i.item_name).filter(Boolean);
     } catch {}
 
     return {
@@ -168,8 +204,8 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
         support:    dInner.support    || 0,
       },
       build,
-      counters:  counterArr.map(h  => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
-      teammates: teammateArr.map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
+      counters:  (findArr(c)    || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
+      teammates: (findArr(comp) || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
     };
   } catch (err) {
     console.error(`[API] Detail error (${heroId}):`, err.message);
@@ -177,91 +213,33 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
 }
 
-// ─── Tier List ────────────────────────────────────────────────────────────────
+// ─── Tier List & Leaderboard (derived from hero stats) ───────────────────────
 async function scrapeTierList() {
-  // Reuse hero stats to avoid duplicate API calls — called separately by server.js
-  // but we'll do a fresh fetch here for simplicity
-  console.log('[API] Fetching tier list...');
-  try {
-    const heroes = await scrapeHeroStats();
-    const tiers  = {};
-
-    heroes.forEach(hero => {
-      if (!tiers[hero.tier]) tiers[hero.tier] = [];
-      tiers[hero.tier].push(hero.name);
-    });
-
-    const order  = ['S+', 'S', 'A', 'B', 'C', 'Unranked'];
-    const sorted = {};
-    order.forEach(t => { if (tiers[t]) sorted[t] = tiers[t]; });
-    Object.keys(tiers).forEach(t => { if (!sorted[t]) sorted[t] = tiers[t]; });
-
-    console.log(`[API] Tier groups: ${Object.keys(sorted).length}`);
-    return sorted;
-  } catch (err) {
-    console.error('[API] Tier list error:', err.message);
-    return {};
-  }
+  // Called by server.js only during boot — server.js now calls scrapeHeroStats() once
+  // and derives tier list itself, so this is just a thin wrapper
+  const heroes = await scrapeHeroStats();
+  const tiers  = {};
+  heroes.forEach(h => {
+    if (!tiers[h.tier]) tiers[h.tier] = [];
+    tiers[h.tier].push(h.name);
+  });
+  const order = ['S+', 'S', 'A', 'B', 'C', 'Unranked'];
+  const sorted = {};
+  order.forEach(t => { if (tiers[t]) sorted[t] = tiers[t]; });
+  Object.keys(tiers).forEach(t => { if (!sorted[t]) sorted[t] = tiers[t]; });
+  return sorted;
 }
 
-// ─── Leaderboard — Top heroes by win rate, ban rate, pick rate ────────────────
-// /mplid/player-stats/ returns empty []. We build a meaningful leaderboard
-// from the hero stats instead: top performers across all three metrics.
 async function scrapeLeaderboard() {
-  console.log('[API] Building leaderboard from hero stats...');
-  try {
-    const heroes = await scrapeHeroStats();
-    if (!heroes.length) return [];
-
-    // Top 10 by win rate
-    const byWin = [...heroes]
-      .sort((a, b) => b._winRate - a._winRate)
-      .slice(0, 10)
-      .map((h, i) => ({
-        rank:     i + 1,
-        name:     h.name,
-        category: 'Top Win Rate',
-        server:   h.role || '—',
-        points:   h.winRate,
-        hero:     h.name,
-        img:      h.img,
-      }));
-
-    // Top 10 by ban rate
-    const byBan = [...heroes]
-      .sort((a, b) => b._banRate - a._banRate)
-      .slice(0, 10)
-      .map((h, i) => ({
-        rank:     i + 1,
-        name:     h.name,
-        category: 'Most Banned',
-        server:   h.role || '—',
-        points:   h.banRate,
-        hero:     h.name,
-        img:      h.img,
-      }));
-
-    // Top 10 by pick rate
-    const byPick = [...heroes]
-      .sort((a, b) => b._pickRate - a._pickRate)
-      .slice(0, 10)
-      .map((h, i) => ({
-        rank:     i + 1,
-        name:     h.name,
-        category: 'Most Picked',
-        server:   h.role || '—',
-        points:   h.pickRate,
-        hero:     h.name,
-        img:      h.img,
-      }));
-
-    const leaderboard = [...byWin, ...byBan, ...byPick];
-    console.log(`[API] Leaderboard entries: ${leaderboard.length}`);
-    return leaderboard;
-  } catch (err) {
-    console.error('[API] Leaderboard error:', err.message);
-    return [];
-  }
+  const heroes = await scrapeHeroStats();
+  if (!heroes.length) return [];
+  const top = (arr, category, stat) =>
+    arr.slice(0, 10).map((h, i) => ({ rank: i+1, name: h.name, category, role: h.role||'—', points: h[stat], hero: h.name, img: h.img }));
+  return [
+    ...top([...heroes].sort((a,b) => b._winRate  - a._winRate),  'Top Win Rate', 'winRate'),
+    ...top([...heroes].sort((a,b) => b._banRate  - a._banRate),  'Most Banned',  'banRate'),
+    ...top([...heroes].sort((a,b) => b._pickRate - a._pickRate), 'Most Picked',  'pickRate'),
+  ];
 }
 
 module.exports = { scrapeHeroStats, scrapeHeroDetail, scrapeTierList, scrapeLeaderboard };
