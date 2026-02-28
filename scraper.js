@@ -58,26 +58,34 @@ function parseHeroRow(row) {
 async function scrapeHeroStats() {
   console.log('[API] Fetching all heroes (paginated)...');
   const allHeroes = [];
+  const seenIds   = new Set();
   let page = 1;
 
   try {
     while (true) {
-      const raw   = await get(`/hero-rank/?page=${page}`);
-      const data  = raw?.data || {};
-      const rows  = data.records || data.results || data.data || [];
+      const raw  = await get(`/hero-rank/?page=${page}`);
+      const data = raw?.data || {};
+      const rows = data.records || data.results || data.data || [];
 
       if (!Array.isArray(rows) || rows.length === 0) break;
 
-      const parsed = rows.map(parseHeroRow).filter(Boolean);
-      allHeroes.push(...parsed);
+      const total = data.total_count || data.count || data.total || null;
+      let added = 0;
 
-      // Check if there are more pages
-      const total    = data.total_count || data.count || data.total || null;
-      const pageSize = rows.length;
-      console.log(`[API] Page ${page}: ${parsed.length} heroes (total so far: ${allHeroes.length}${total ? '/' + total : ''})`);
+      for (const row of rows) {
+        const hero = parseHeroRow(row);
+        if (!hero) continue;
+        const key = hero.heroId || hero.name; // deduplicate
+        if (seenIds.has(key)) continue;
+        seenIds.add(key);
+        allHeroes.push(hero);
+        added++;
+      }
+
+      console.log(`[API] Page ${page}: +${added} heroes (total: ${allHeroes.length}${total ? '/' + total : ''})`);
 
       if (total && allHeroes.length >= total) break;
-      if (rows.length < pageSize || rows.length < 20) break; // last page
+      if (rows.length < 20) break; // last page returned a partial set
       page++;
       if (page > 20) break; // safety cap
     }
