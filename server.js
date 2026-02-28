@@ -253,10 +253,25 @@ app.post('/api/scrape', async (req, res) => {
   runScrape();
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', path: req.path });
-});
+// ─── Serve frontend from /public folder ──────────────────────────────────────
+// Put index.html inside a /public folder next to server.js.
+// Backend and frontend share one Railway service — no URL config needed.
+const path = require('path');
+const fs   = require('fs');
+const publicDir = path.join(__dirname, 'public');
+
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir));
+  app.get('*', (req, res) => {
+    const indexFile = path.join(publicDir, 'index.html');
+    if (fs.existsSync(indexFile)) return res.sendFile(indexFile);
+    res.status(404).json({ error: 'Not found' });
+  });
+} else {
+  app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+  });
+}
 
 // ─── Cron: every hour ─────────────────────────────────────────────────────────
 cron.schedule('0 * * * *', () => {
@@ -267,7 +282,12 @@ cron.schedule('0 * * * *', () => {
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
-  console.log(`\n🚀 MLBB API running on port ${PORT}`);
+  const host = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `http://localhost:${PORT}`;
+  console.log(`
+🚀 MLBB API running on port ${PORT}`);
+  console.log(`🌐 Public URL: ${host}`);
   console.log(`📡 Scraping mlbb-stats.ridwaanhall.com every hour`);
   console.log(`🤖 AI powered by Claude (Anthropic)\n`);
   await runScrape();
