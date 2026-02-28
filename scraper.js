@@ -14,11 +14,9 @@ function extractArray(data) {
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== 'object') return [];
 
-  // Try common wrapper keys in order of likelihood
   const keys = ['data', 'results', 'list', 'rows', 'heroes', 'items', 'records'];
   for (const key of keys) {
     if (Array.isArray(data[key])) return data[key];
-    // One level deeper: e.g. data.data.list
     if (data[key] && typeof data[key] === 'object') {
       for (const inner of keys) {
         if (Array.isArray(data[key][inner])) return data[key][inner];
@@ -26,35 +24,57 @@ function extractArray(data) {
     }
   }
 
-  // Last resort: return values of the object if they look like hero entries
   const vals = Object.values(data);
   if (vals.length && typeof vals[0] === 'object') return vals;
 
-  console.warn('[API] extractArray: could not find array in response. Keys:', Object.keys(data));
   return [];
+}
+
+// ─── Parse a single hero row from /hero-rank/ ─────────────────────────────────
+// Actual shape:
+// { data: { main_hero: { data: { head, name } }, main_hero_win_rate,
+//           main_hero_ban_rate, main_hero_appearance_rate, main_heroid } }
+function parseHeroRow(row) {
+  try {
+    const inner    = row.data || row;
+    const heroData = inner.main_hero?.data || {};
+
+    const name = heroData.name || heroData.hero_name;
+    if (!name) return null;
+
+    const winRate  = inner.main_hero_win_rate;
+    const banRate  = inner.main_hero_ban_rate;
+    const pickRate = inner.main_hero_appearance_rate;
+    const role     = heroData.role || heroData.type || heroData.hero_type || inner.role || '—';
+    const tier     = inner.tier || inner.rank || inner.grade || heroData.tier || '—';
+    const img      = heroData.head || heroData.image || heroData.icon || '';
+    const heroId   = inner.main_heroid || heroData.id || null;
+
+    return {
+      name,
+      role,
+      winRate:  winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
+      banRate:  banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
+      pickRate: pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
+      tier,
+      img,
+      heroId,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ─── Hero List with win/ban/pick rates ────────────────────────────────────────
 async function scrapeHeroStats() {
   console.log('[API] Fetching hero rank list...');
   try {
-    const raw = await get('/hero-rank/');
-    console.log('[API] hero-rank raw keys:', raw && typeof raw === 'object' ? Object.keys(raw) : typeof raw);
+    const raw  = await get('/hero-rank/');
+    const rows = extractArray(raw.data ?? raw);
 
-    const rows = extractArray(raw);
-    console.log('[API] hero-rank rows sample:', JSON.stringify(rows[0] || {}));
+    console.log(`[API] hero-rank: ${rows.length} rows found`);
 
-    const heroes = rows.map(h => ({
-      name:      h.name || h.hero_name || h.heroName,
-      role:      h.role || h.type || h.lane || h.hero_type,
-      winRate:   h.win_rate   ? `${(h.win_rate * 100).toFixed(1)}%`   : (h.winRate   || h.win_rate_str   || '—'),
-      banRate:   h.ban_rate   ? `${(h.ban_rate * 100).toFixed(1)}%`   : (h.banRate   || h.ban_rate_str   || '—'),
-      pickRate:  h.pick_rate  ? `${(h.pick_rate * 100).toFixed(1)}%`  : (h.pickRate  || h.pick_rate_str  || '—'),
-      tier:      h.tier || h.rank || h.grade || '—',
-      img:       h.image || h.icon || h.head_image || h.avatar || '',
-      heroId:    h.hero_id || h.id || null,
-    })).filter(h => h.name);
-
+    const heroes = rows.map(parseHeroRow).filter(Boolean);
     console.log(`[API] Got ${heroes.length} heroes`);
     return heroes;
   } catch (err) {
@@ -74,46 +94,41 @@ async function scrapeHeroDetail(slug) {
       get(`/hero-compatibility/${slug}/`),
     ]);
 
-    const rawDetail = detail.value || {};
-    const rawStats  = stats.value  || {};
-    const rawC      = counters.value || {};
-    const rawComp   = compatibility.value || {};
+    const d    = detail.value?.data        || detail.value        || {};
+    const s    = stats.value?.data         || stats.value         || {};
+    const c    = counters.value?.data      || counters.value      || {};
+    const comp = compatibility.value?.data || compatibility.value || {};
 
-    // Extract nested data objects
-    const d = rawDetail.data || rawDetail;
-    const s = rawStats.data  || rawStats;
-    const c = rawC.data      || rawC;
-    const comp = rawComp.data || rawComp;
+    const dInner = d.data || d;
+    const sInner = s.data || s;
 
-    // Build recommended items from academy
     let build = [];
     try {
-      const guide = await get(`/academy/guide/${slug}/builds/`);
-      const builds = extractArray(guide);
+      const guide  = await get(`/academy/guide/${slug}/builds/`);
+      const builds = extractArray(guide?.data ?? guide);
       if (builds.length) {
         const top = builds[0];
         build = (top.items || top.equipment || []).map(i => i.name || i.item_name).filter(Boolean);
       }
     } catch {}
 
-    // Extract counters / teammates from various possible shapes
-    const counterList = extractArray(c.counters || c.counter_heroes || c.data || c);
+    const counterList  = extractArray(c.counters    || c.counter_heroes || c.data || c);
     const teammateList = extractArray(comp.teammates || comp.best_partners || comp.data || comp);
 
     return {
-      name:        d.name || slug,
-      role:        d.role || d.type || d.hero_type,
-      description: d.story || d.lore || d.description || '',
-      img:         d.head_image || d.image || d.avatar || '',
+      name:        dInner.name || slug,
+      role:        dInner.role || dInner.type || dInner.hero_type,
+      description: dInner.story || dInner.lore || dInner.description || '',
+      img:         dInner.head_image || dInner.image || dInner.head || dInner.avatar || '',
       stats: {
-        durability: s.durability || 0,
-        offense:    s.offense    || 0,
-        control:    s.control    || 0,
-        mobility:   s.mobility   || 0,
-        support:    s.support    || 0,
+        durability: sInner.durability || 0,
+        offense:    sInner.offense    || 0,
+        control:    sInner.control    || 0,
+        mobility:   sInner.mobility   || 0,
+        support:    sInner.support    || 0,
       },
       build,
-      counters:  counterList.map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
+      counters:  counterList.map(h  => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
       teammates: teammateList.map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
     };
   } catch (err) {
@@ -126,17 +141,16 @@ async function scrapeHeroDetail(slug) {
 async function scrapeTierList() {
   console.log('[API] Fetching tier list...');
   try {
-    const raw = await get('/hero-rank/');
-    console.log('[API] tier-list raw keys:', raw && typeof raw === 'object' ? Object.keys(raw) : typeof raw);
-
-    const rows = extractArray(raw);
+    const raw   = await get('/hero-rank/');
+    const rows  = extractArray(raw.data ?? raw);
     const tiers = {};
 
-    rows.forEach(h => {
-      const tier = h.tier || h.rank || h.grade || 'Unranked';
+    rows.forEach(row => {
+      const hero = parseHeroRow(row);
+      if (!hero) return;
+      const tier = hero.tier || 'Unranked';
       if (!tiers[tier]) tiers[tier] = [];
-      const name = h.name || h.hero_name;
-      if (name) tiers[tier].push(name);
+      tiers[tier].push(hero.name);
     });
 
     console.log(`[API] Tier groups: ${Object.keys(tiers).length}`);
@@ -151,20 +165,29 @@ async function scrapeTierList() {
 async function scrapeLeaderboard() {
   console.log('[API] Fetching leaderboard...');
   try {
-    const raw = await get('/mplid/player-stats/');
-    console.log('[API] leaderboard raw keys:', raw && typeof raw === 'object' ? Object.keys(raw) : typeof raw);
+    const raw  = await get('/mplid/player-stats/');
 
-    const rows = extractArray(raw);
+    console.log('[API] leaderboard raw type:', typeof raw, Array.isArray(raw) ? '(array)' : '');
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      console.log('[API] leaderboard raw keys:', Object.keys(raw));
+    }
 
-    const players = rows.map((p, i) => ({
-      rank:   p.rank || i + 1,
-      name:   p.player_name || p.name || p.username,
-      server: p.team || p.server || p.region || '—',
-      points: p.rating || p.points || p.kda || p.score || '—',
-      hero:   p.most_used_hero || p.hero || p.favorite_hero || '—',
-    })).filter(p => p.name);
+    const rows = extractArray(raw?.data ?? raw);
+    console.log(`[API] leaderboard rows: ${rows.length}`);
+    if (rows[0]) console.log('[API] leaderboard sample row keys:', Object.keys(rows[0]));
 
-    console.log(`[API] Players: ${players.length}`);
+    const players = rows.map((p, i) => {
+      const inner = p.data || p;
+      return {
+        rank:   inner.rank || i + 1,
+        name:   inner.player_name || inner.name || inner.username || inner.nickname,
+        server: inner.team || inner.server || inner.region || '—',
+        points: inner.rating || inner.points || inner.kda || inner.score || '—',
+        hero:   inner.most_used_hero || inner.hero || inner.favorite_hero || '—',
+      };
+    }).filter(p => p.name);
+
+    console.log(`[API] Players parsed: ${players.length}`);
     return players.slice(0, 100);
   } catch (err) {
     console.error('[API] Leaderboard error:', err.message);
