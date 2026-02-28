@@ -1,4 +1,5 @@
-// scraper.js — Powered by mlbb-stats.ridwaanhall.com
+// scraper.js — Powered by mlbb-stats.ridwaanhall.com (data from Moonton's official MLBB servers)
+// Docs: https://mlbb-stats-docs.ridwaanhall.com/
 const axios = require('axios');
 
 const BASE = 'https://mlbb-stats.ridwaanhall.com/api';
@@ -7,19 +8,6 @@ const HEADERS = { 'User-Agent': 'mlbbai-app/1.0' };
 async function get(path) {
   const res = await axios.get(`${BASE}${path}`, { headers: HEADERS, timeout: 15000 });
   return res.data;
-}
-
-// ─── Recursively find the first array in a nested object ─────────────────────
-function findArray(obj, depth = 0) {
-  if (depth > 5) return null;
-  if (Array.isArray(obj) && obj.length > 0) return obj;
-  if (obj && typeof obj === 'object') {
-    for (const key of Object.keys(obj)) {
-      const found = findArray(obj[key], depth + 1);
-      if (found) return found;
-    }
-  }
-  return null;
 }
 
 function tierFromWinRate(wr) {
@@ -32,6 +20,10 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
+// ─── Parse a single row from /hero-rank/ ─────────────────────────────────────
+// Shape: { data: { main_hero: { data: { head, name } },
+//                  main_hero_win_rate, main_hero_ban_rate,
+//                  main_hero_appearance_rate, main_heroid } }
 function parseHeroRow(row) {
   try {
     const d        = row.data || row;
@@ -52,35 +44,49 @@ function parseHeroRow(row) {
       tier:     tierFromWinRate(winRate),
       img:      heroData.head || heroData.image || heroData.icon || '',
       heroId:   d.main_heroid || heroData.id || null,
+      // Keep raw values for leaderboard sorting
+      _winRate:  winRate  || 0,
+      _banRate:  banRate  || 0,
+      _pickRate: pickRate || 0,
     };
   } catch {
     return null;
   }
 }
 
-// ─── Hero List ────────────────────────────────────────────────────────────────
+// ─── Fetch ALL heroes by paginating through /hero-rank/ ───────────────────────
 async function scrapeHeroStats() {
-  console.log('[API] Fetching hero rank list...');
+  console.log('[API] Fetching all heroes (paginated)...');
+  const allHeroes = [];
+  let page = 1;
+
   try {
-    const raw = await get('/hero-rank/');
+    while (true) {
+      const raw   = await get(`/hero-rank/?page=${page}`);
+      const data  = raw?.data || {};
+      const rows  = data.records || data.results || data.data || [];
 
-    // FULL DUMP — so we can see the real structure
-    const dump = JSON.stringify(raw).slice(0, 1000);
-    console.log('[API] hero-rank RAW (first 1000 chars):', dump);
+      if (!Array.isArray(rows) || rows.length === 0) break;
 
-    const rows = findArray(raw);
-    console.log(`[API] hero-rank: ${rows?.length ?? 0} rows found`);
-    if (rows?.[0]) console.log('[API] hero-rank row[0]:', JSON.stringify(rows[0]).slice(0, 500));
+      const parsed = rows.map(parseHeroRow).filter(Boolean);
+      allHeroes.push(...parsed);
 
-    if (!rows?.length) return [];
+      // Check if there are more pages
+      const total    = data.total_count || data.count || data.total || null;
+      const pageSize = rows.length;
+      console.log(`[API] Page ${page}: ${parsed.length} heroes (total so far: ${allHeroes.length}${total ? '/' + total : ''})`);
 
-    const heroes = rows.map(parseHeroRow).filter(Boolean);
-    console.log(`[API] Parsed ${heroes.length} heroes`);
-    return heroes;
+      if (total && allHeroes.length >= total) break;
+      if (rows.length < pageSize || rows.length < 20) break; // last page
+      page++;
+      if (page > 20) break; // safety cap
+    }
   } catch (err) {
     console.error('[API] Hero list error:', err.message);
-    return [];
   }
+
+  console.log(`[API] Total heroes fetched: ${allHeroes.length}`);
+  return allHeroes;
 }
 
 // ─── Single Hero Detail ───────────────────────────────────────────────────────
@@ -111,18 +117,29 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
     const comp = compatibility.value?.data || compatibility.value || {};
     const dInner = d.data || d;
 
-    const counterArr  = findArray(c)    || [];
-    const teammateArr = findArray(comp) || [];
+    // Recursively find arrays for counters/teammates
+    function findArr(obj, depth = 0) {
+      if (depth > 4) return null;
+      if (Array.isArray(obj) && obj.length) return obj;
+      if (obj && typeof obj === 'object') {
+        for (const v of Object.values(obj)) {
+          const f = findArr(v, depth + 1);
+          if (f) return f;
+        }
+      }
+      return null;
+    }
+
+    const counterArr  = findArr(c)    || [];
+    const teammateArr = findArr(comp) || [];
 
     let build = [];
     try {
       const guide  = await get(`/academy/guide/${heroId}/builds/`);
-      const builds = findArray(guide) || [];
+      const builds = findArr(guide) || [];
       if (builds.length) {
-        const top = builds[0];
-        build = (top.items || top.equipment || [])
-          .map(i => i.name || i.item_name)
-          .filter(Boolean);
+        build = (builds[0].items || builds[0].equipment || [])
+          .map(i => i.name || i.item_name).filter(Boolean);
       }
     } catch {}
 
@@ -150,20 +167,19 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
 
 // ─── Tier List ────────────────────────────────────────────────────────────────
 async function scrapeTierList() {
+  // Reuse hero stats to avoid duplicate API calls — called separately by server.js
+  // but we'll do a fresh fetch here for simplicity
   console.log('[API] Fetching tier list...');
   try {
-    const raw  = await get('/hero-rank/');
-    const rows = findArray(raw) || [];
-    const tiers = {};
+    const heroes = await scrapeHeroStats();
+    const tiers  = {};
 
-    rows.forEach(row => {
-      const hero = parseHeroRow(row);
-      if (!hero) return;
+    heroes.forEach(hero => {
       if (!tiers[hero.tier]) tiers[hero.tier] = [];
       tiers[hero.tier].push(hero.name);
     });
 
-    const order = ['S+', 'S', 'A', 'B', 'C', 'Unranked'];
+    const order  = ['S+', 'S', 'A', 'B', 'C', 'Unranked'];
     const sorted = {};
     order.forEach(t => { if (tiers[t]) sorted[t] = tiers[t]; });
     Object.keys(tiers).forEach(t => { if (!sorted[t]) sorted[t] = tiers[t]; });
@@ -176,38 +192,60 @@ async function scrapeTierList() {
   }
 }
 
-// ─── Leaderboard ─────────────────────────────────────────────────────────────
+// ─── Leaderboard — Top heroes by win rate, ban rate, pick rate ────────────────
+// /mplid/player-stats/ returns empty []. We build a meaningful leaderboard
+// from the hero stats instead: top performers across all three metrics.
 async function scrapeLeaderboard() {
-  console.log('[API] Fetching leaderboard...');
+  console.log('[API] Building leaderboard from hero stats...');
   try {
-    const raw = await get('/mplid/player-stats/');
+    const heroes = await scrapeHeroStats();
+    if (!heroes.length) return [];
 
-    // FULL DUMP
-    console.log('[API] leaderboard RAW (first 1000 chars):', JSON.stringify(raw).slice(0, 1000));
+    // Top 10 by win rate
+    const byWin = [...heroes]
+      .sort((a, b) => b._winRate - a._winRate)
+      .slice(0, 10)
+      .map((h, i) => ({
+        rank:     i + 1,
+        name:     h.name,
+        category: 'Top Win Rate',
+        server:   h.role || '—',
+        points:   h.winRate,
+        hero:     h.name,
+        img:      h.img,
+      }));
 
-    const rows = findArray(raw) || [];
-    console.log(`[API] Leaderboard rows: ${rows.length}`);
-    if (rows[0]) console.log('[API] Leaderboard row[0]:', JSON.stringify(rows[0]).slice(0, 500));
+    // Top 10 by ban rate
+    const byBan = [...heroes]
+      .sort((a, b) => b._banRate - a._banRate)
+      .slice(0, 10)
+      .map((h, i) => ({
+        rank:     i + 1,
+        name:     h.name,
+        category: 'Most Banned',
+        server:   h.role || '—',
+        points:   h.banRate,
+        hero:     h.name,
+        img:      h.img,
+      }));
 
-    const players = rows.map((p, i) => {
-      const inner = p.data || p;
-      const name =
-        inner.player_name || inner.playerName || inner.name ||
-        inner.username    || inner.nickname   || inner.gameName ||
-        inner.game_name   || inner.ign;
-      if (!name) return null;
+    // Top 10 by pick rate
+    const byPick = [...heroes]
+      .sort((a, b) => b._pickRate - a._pickRate)
+      .slice(0, 10)
+      .map((h, i) => ({
+        rank:     i + 1,
+        name:     h.name,
+        category: 'Most Picked',
+        server:   h.role || '—',
+        points:   h.pickRate,
+        hero:     h.name,
+        img:      h.img,
+      }));
 
-      return {
-        rank:   inner.rank     || inner.position || i + 1,
-        name,
-        server: inner.team     || inner.server   || inner.region   || inner.country || '—',
-        points: inner.rating   || inner.points   || inner.score    || inner.kda     || '—',
-        hero:   inner.most_used_hero || inner.hero || inner.main_hero || inner.favorite_hero || '—',
-      };
-    }).filter(Boolean);
-
-    console.log(`[API] Players parsed: ${players.length}`);
-    return players.slice(0, 100);
+    const leaderboard = [...byWin, ...byBan, ...byPick];
+    console.log(`[API] Leaderboard entries: ${leaderboard.length}`);
+    return leaderboard;
   } catch (err) {
     console.error('[API] Leaderboard error:', err.message);
     return [];
