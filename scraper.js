@@ -54,93 +54,95 @@ function parseHeroRow(row) {
   } catch { return null; }
 }
 
-// Known MLBB hero IDs — Moonton assigns sequential IDs.
-// Heroes currently go from roughly ID 1 to ~150 (with gaps for unreleased/removed).
-// We scan all IDs and skip 404s.
-function knownHeroIds() {
-  const ids = [];
-  for (let i = 1; i <= 160; i++) ids.push(i);
-  return ids;
-}
+// ─── Diagnostics — run once on boot to understand API shapes ─────────────────
+let diagDone = false;
+async function runDiagnostics(knownId) {
+  if (diagDone) return;
+  diagDone = true;
+  console.log('\n[DIAG] ========== API DIAGNOSTIC ==========');
 
-// Parse a hero-detail response into our standard hero shape
-function parseDetailAsHero(raw, heroId) {
+  // 1. What does hero-detail look like for a known ID?
   try {
-    const outer = raw?.data || raw;
-    const d     = outer?.data || outer;
+    const r = await get(`/hero-detail/${knownId}/`);
+    console.log(`[DIAG] hero-detail/${knownId} keys:`, Object.keys(r || {}));
+    console.log(`[DIAG] hero-detail/${knownId} full:`, JSON.stringify(r).slice(0, 800));
+  } catch(e) { console.log(`[DIAG] hero-detail/${knownId} ERROR:`, e.message); }
 
-    const name = d.name || d.hero_name;
-    if (!name) return null;
+  // 2. What does hero-detail look like for ID 1?
+  try {
+    const r = await get('/hero-detail/1/');
+    console.log('[DIAG] hero-detail/1 full:', JSON.stringify(r).slice(0, 400));
+  } catch(e) { console.log('[DIAG] hero-detail/1 ERROR:', e.message); }
 
-    return {
-      name,
-      role:      d.role || d.type || d.hero_type || '—',
-      winRate:   '—',
-      banRate:   '—',
-      pickRate:  '—',
-      tier:      'Unranked',
-      img:       d.head || d.head_image || d.image || d.icon || d.avatar || '',
-      heroId,
-      _winRate:  0,
-      _banRate:  0,
-      _pickRate: 0,
-    };
-  } catch { return null; }
+  // 3. Does the rank endpoint have a "list all" or "no pagination" mode?
+  try {
+    const r = await get('/hero-rank/?page_size=999&page=1&limit=999&offset=0&all=true');
+    const count = r?.data?.records?.length || r?.data?.data?.length || 0;
+    console.log('[DIAG] hero-rank all-params record count:', count);
+    console.log('[DIAG] hero-rank data keys:', Object.keys(r?.data || {}));
+  } catch(e) { console.log('[DIAG] hero-rank all-params ERROR:', e.message); }
+
+  // 4. Try hero-list endpoint
+  try {
+    const r = await get('/hero-list/');
+    console.log('[DIAG] hero-list full:', JSON.stringify(r).slice(0, 600));
+  } catch(e) { console.log('[DIAG] hero-list ERROR:', e.message); }
+
+  // 5. Try heroes endpoint
+  try {
+    const r = await get('/heroes/');
+    console.log('[DIAG] /heroes/ full:', JSON.stringify(r).slice(0, 600));
+  } catch(e) { console.log('[DIAG] /heroes/ ERROR:', e.message); }
+
+  // 6. Check the rank data keys to find total_count path
+  try {
+    const r = await post('/hero-rank/', {});
+    console.log('[DIAG] hero-rank POST empty body:', JSON.stringify(r).slice(0, 400));
+    if (r?.data) {
+      console.log('[DIAG] hero-rank data keys:', Object.keys(r.data));
+      console.log('[DIAG] hero-rank total fields:', JSON.stringify({
+        total_count: r.data.total_count,
+        count: r.data.count,
+        total: r.data.total,
+        num_pages: r.data.num_pages,
+        page_count: r.data.page_count,
+      }));
+    }
+  } catch(e) { console.log('[DIAG] hero-rank POST ERROR:', e.message); }
+
+  console.log('[DIAG] ==========================================\n');
 }
 
 // ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
 async function scrapeHeroStats() {
-  console.log('[API] Fetching hero rank list (page 1)...');
+  console.log('[API] Fetching hero rank list...');
 
-  // Step 1: get rank stats for the top 20 from the rank endpoint
-  const rankMap = {}; // heroId -> rank stats
+  const allHeroes = [];
+  const seenIds   = new Set();
+
   try {
-    const raw  = await post('/hero-rank/', { page_size: 20, page_index: 1 });
+    const raw  = await post('/hero-rank/', {});
     const rows = raw?.data?.records || [];
+
+    // Run diagnostics using first known hero ID
+    const firstId = rows[0]?.data?.main_heroid;
+    if (firstId) await runDiagnostics(firstId);
+
     for (const row of rows) {
       const h = parseHeroRow(row);
-      if (h?.heroId) rankMap[h.heroId] = h;
+      if (!h?.heroId) continue;
+      if (seenIds.has(h.heroId)) continue;
+      seenIds.add(h.heroId);
+      allHeroes.push(h);
     }
-    console.log(`[API] Got rank stats for ${Object.keys(rankMap).length} heroes`);
+
+    const total = raw?.data?.total_count || raw?.data?.count || raw?.data?.total || '?';
+    console.log(`[API] Got ${allHeroes.length} heroes from rank (API total: ${total})`);
+
   } catch (e) {
-    console.error('[API] Rank fetch failed:', e.message);
+    console.error('[API] Rank fetch error:', e.message);
   }
 
-  // Step 2: scan all known hero IDs via the detail endpoint to get full roster
-  // Batch requests in groups of 10 to avoid overwhelming the API
-  const allHeroes = [];
-  const seenIds   = new Set(Object.keys(rankMap).map(Number));
-
-  // First add the rank heroes (they have full stats)
-  Object.values(rankMap).forEach(h => allHeroes.push(h));
-
-  const ids      = knownHeroIds().filter(id => !seenIds.has(id));
-  const BATCH    = 10;
-  let found      = 0;
-
-  console.log(`[API] Scanning ${ids.length} hero IDs for remaining heroes...`);
-
-  for (let i = 0; i < ids.length; i += BATCH) {
-    const batch   = ids.slice(i, i + BATCH);
-    const results = await Promise.allSettled(
-      batch.map(id => get(`/hero-detail/${id}/`))
-    );
-
-    for (let j = 0; j < results.length; j++) {
-      const r = results[j];
-      if (r.status !== 'fulfilled') continue;
-      const hero = parseDetailAsHero(r.value, batch[j]);
-      if (!hero) continue;
-      allHeroes.push(hero);
-      seenIds.add(batch[j]);
-      found++;
-    }
-
-    // Small delay to be respectful to the API
-    if (i + BATCH < ids.length) await new Promise(r => setTimeout(r, 200));
-  }
-
-  console.log(`[API] ID scan complete: +${found} additional heroes`);
   console.log(`[API] Total heroes: ${allHeroes.length}`);
   return allHeroes;
 }
@@ -154,7 +156,6 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
   if (!heroId) { console.warn(`[API] No heroId for: ${heroIdOrSlug}`); return {}; }
 
-  console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
     const [detail, counters, compatibility] = await Promise.allSettled([
       get(`/hero-detail/${heroId}/`),
