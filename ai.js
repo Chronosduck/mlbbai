@@ -35,7 +35,7 @@ Hero Data:
 ${hero.stats ? `- Ability Scores: Durability ${hero.stats.durability}, Offense ${hero.stats.offense}, Control ${hero.stats.control}, Mobility ${hero.stats.mobility}, Support ${hero.stats.support}` : ''}
 ${hero.build?.length ? `- Recommended Build: ${hero.build.join(', ')}` : ''}
 
-Provide a comprehensive analysis. Return ONLY valid JSON, no markdown, no extra text:
+You have deep passion for MLBB. Write with personality and insight — be opinionated about this hero's place in the meta. Return ONLY valid JSON, no markdown, no extra text:
 {
   "overview": "2-3 sentences on this hero's identity and current meta role",
   "playstyle": "How to play effectively — key mechanics, skill order, and combos",
@@ -81,7 +81,7 @@ Analyze the team synergy between:
 Hero 1: ${hero1.name} (${hero1.role || 'Unknown'}) — Win Rate: ${hero1.winRate || 'N/A'}, Tier: ${hero1.tier || 'N/A'}
 Hero 2: ${hero2.name} (${hero2.role || 'Unknown'}) — Win Rate: ${hero2.winRate || 'N/A'}, Tier: ${hero2.tier || 'N/A'}
 
-Return ONLY valid JSON, no markdown, no extra text:
+Be specific and opinionated — avoid generic teamwork advice. Return ONLY valid JSON, no markdown, no extra text:
 {
   "synergyScore": 78,
   "verdict": "One sentence verdict on this combo's viability",
