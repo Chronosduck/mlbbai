@@ -56,14 +56,14 @@ function parseHeroRow(row) {
 
 // ─── Fetch ALL heroes by paginating through /hero-rank/ ───────────────────────
 async function scrapeHeroStats() {
-  console.log('[API] Fetching all heroes (paginated)...');
+  console.log('[API] Fetching all heroes...');
   const allHeroes = [];
   const seenIds   = new Set();
-  let page = 1;
 
   try {
-    while (true) {
-      const raw  = await get(`/hero-rank/?page=${page}`);
+    // Max page_size is 126 — fetch all in 2 passes
+    for (let pageIndex = 1; pageIndex <= 2; pageIndex++) {
+      const raw  = await get(`/hero-rank/?page_size=126&page_index=${pageIndex}`);
       const data = raw?.data || {};
       const rows = data.records || data.results || data.data || [];
 
@@ -75,19 +75,15 @@ async function scrapeHeroStats() {
       for (const row of rows) {
         const hero = parseHeroRow(row);
         if (!hero) continue;
-        const key = hero.heroId || hero.name; // deduplicate
+        const key = hero.heroId || hero.name;
         if (seenIds.has(key)) continue;
         seenIds.add(key);
         allHeroes.push(hero);
         added++;
       }
 
-      console.log(`[API] Page ${page}: +${added} heroes (total: ${allHeroes.length}${total ? '/' + total : ''})`);
-
+      console.log(`[API] Page ${pageIndex}: +${added} heroes (total: ${allHeroes.length}${total ? '/' + total : ''})`);
       if (total && allHeroes.length >= total) break;
-      if (rows.length < 20) break; // last page returned a partial set
-      page++;
-      if (page > 20) break; // safety cap
     }
   } catch (err) {
     console.error('[API] Hero list error:', err.message);
