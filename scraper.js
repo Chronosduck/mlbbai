@@ -1,5 +1,4 @@
-// scraper.js — Powered by mlbb-stats.ridwaanhall.com (data sourced from Moonton's official MLBB servers)
-// Docs: https://mlbb-stats-docs.ridwaanhall.com/
+// scraper.js — Powered by mlbb-stats.ridwaanhall.com
 const axios = require('axios');
 
 const BASE = 'https://mlbb-stats.ridwaanhall.com/api';
@@ -10,7 +9,19 @@ async function get(path) {
   return res.data;
 }
 
-// ─── Derive tier from win rate (API doesn't supply one) ───────────────────────
+// ─── Recursively find the first array in a nested object ─────────────────────
+function findArray(obj, depth = 0) {
+  if (depth > 5) return null;
+  if (Array.isArray(obj) && obj.length > 0) return obj;
+  if (obj && typeof obj === 'object') {
+    for (const key of Object.keys(obj)) {
+      const found = findArray(obj[key], depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function tierFromWinRate(wr) {
   if (wr == null) return 'Unranked';
   const pct = wr * 100;
@@ -21,10 +32,6 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
-// ─── Parse a single row from /hero-rank/ ─────────────────────────────────────
-// Confirmed shape from logs:
-// row.data.main_hero.data.{ name, head }
-// row.data.{ main_hero_win_rate, main_hero_ban_rate, main_hero_appearance_rate, main_heroid }
 function parseHeroRow(row) {
   try {
     const d        = row.data || row;
@@ -55,10 +62,17 @@ function parseHeroRow(row) {
 async function scrapeHeroStats() {
   console.log('[API] Fetching hero rank list...');
   try {
-    const raw  = await get('/hero-rank/');
-    // Confirmed: raw.data is the array
-    const rows = Array.isArray(raw.data) ? raw.data : [];
-    console.log(`[API] hero-rank: ${rows.length} rows`);
+    const raw = await get('/hero-rank/');
+
+    // FULL DUMP — so we can see the real structure
+    const dump = JSON.stringify(raw).slice(0, 1000);
+    console.log('[API] hero-rank RAW (first 1000 chars):', dump);
+
+    const rows = findArray(raw);
+    console.log(`[API] hero-rank: ${rows?.length ?? 0} rows found`);
+    if (rows?.[0]) console.log('[API] hero-rank row[0]:', JSON.stringify(rows[0]).slice(0, 500));
+
+    if (!rows?.length) return [];
 
     const heroes = rows.map(parseHeroRow).filter(Boolean);
     console.log(`[API] Parsed ${heroes.length} heroes`);
@@ -69,9 +83,8 @@ async function scrapeHeroStats() {
   }
 }
 
-// ─── Single Hero Detail (uses heroId, not slug) ───────────────────────────────
+// ─── Single Hero Detail ───────────────────────────────────────────────────────
 async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
-  // Resolve to a numeric heroId if we got a name/slug
   let heroId = heroIdOrSlug;
   if (isNaN(heroIdOrSlug)) {
     const match = allHeroes.find(
@@ -93,28 +106,18 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
       get(`/hero-compatibility/${heroId}/`),
     ]);
 
-    // Each response: { code, data: { ... } }
     const d    = detail.value?.data        || detail.value        || {};
     const c    = counters.value?.data      || counters.value      || {};
     const comp = compatibility.value?.data || compatibility.value || {};
-
-    // Flatten one more level if needed
     const dInner = d.data || d;
 
-    // Extract counter/teammate arrays from whatever shape they come in
-    const counterArr  = Array.isArray(c)        ? c        :
-                        Array.isArray(c.data)   ? c.data   :
-                        Array.isArray(c.counters) ? c.counters : [];
-    const teammateArr = Array.isArray(comp)       ? comp       :
-                        Array.isArray(comp.data)  ? comp.data  :
-                        Array.isArray(comp.teammates) ? comp.teammates : [];
+    const counterArr  = findArray(c)    || [];
+    const teammateArr = findArray(comp) || [];
 
     let build = [];
     try {
       const guide  = await get(`/academy/guide/${heroId}/builds/`);
-      const builds = Array.isArray(guide?.data) ? guide.data
-                   : Array.isArray(guide)        ? guide
-                   : [];
+      const builds = findArray(guide) || [];
       if (builds.length) {
         const top = builds[0];
         build = (top.items || top.equipment || [])
@@ -150,7 +153,7 @@ async function scrapeTierList() {
   console.log('[API] Fetching tier list...');
   try {
     const raw  = await get('/hero-rank/');
-    const rows = Array.isArray(raw.data) ? raw.data : [];
+    const rows = findArray(raw) || [];
     const tiers = {};
 
     rows.forEach(row => {
@@ -160,7 +163,6 @@ async function scrapeTierList() {
       tiers[hero.tier].push(hero.name);
     });
 
-    // Sort tiers in order
     const order = ['S+', 'S', 'A', 'B', 'C', 'Unranked'];
     const sorted = {};
     order.forEach(t => { if (tiers[t]) sorted[t] = tiers[t]; });
@@ -174,29 +176,25 @@ async function scrapeTierList() {
   }
 }
 
-// ─── Leaderboard (MPL ID player stats) ───────────────────────────────────────
+// ─── Leaderboard ─────────────────────────────────────────────────────────────
 async function scrapeLeaderboard() {
   console.log('[API] Fetching leaderboard...');
   try {
-    // Try the MPL ID endpoint — confirmed it returns an array
     const raw = await get('/mplid/player-stats/');
 
-    // raw might be the array directly, or wrapped in .data
-    const rows = Array.isArray(raw)      ? raw
-               : Array.isArray(raw.data) ? raw.data
-               : [];
+    // FULL DUMP
+    console.log('[API] leaderboard RAW (first 1000 chars):', JSON.stringify(raw).slice(0, 1000));
 
+    const rows = findArray(raw) || [];
     console.log(`[API] Leaderboard rows: ${rows.length}`);
-    if (rows[0]) console.log('[API] Leaderboard row[0]:', JSON.stringify(rows[0]));
+    if (rows[0]) console.log('[API] Leaderboard row[0]:', JSON.stringify(rows[0]).slice(0, 500));
 
     const players = rows.map((p, i) => {
       const inner = p.data || p;
-      // Try every possible field name for player name
       const name =
         inner.player_name || inner.playerName || inner.name ||
         inner.username    || inner.nickname   || inner.gameName ||
         inner.game_name   || inner.ign;
-
       if (!name) return null;
 
       return {
