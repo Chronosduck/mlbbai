@@ -27,16 +27,77 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
-// ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
-// /hero-list/ returns full roster (confirmed from diagnostics)
-// /hero-rank/ returns top 20 with win/ban/pick stats
-// We merge them: all heroes from hero-list, stats overlaid from hero-rank
+// Parse a hero-rank record into stats object
+function parseRankRow(row) {
+  const d        = row.data || row;
+  const heroData = d.main_hero?.data || {};
+  const winRate  = d.main_hero_win_rate;
+  const banRate  = d.main_hero_ban_rate;
+  const pickRate = d.main_hero_appearance_rate;
+  const heroId   = d.main_heroid;
+  if (!heroId) return null;
+  return {
+    heroId,
+    name:      heroData.name || null,
+    img:       heroData.head || heroData.image || '',
+    winRate:   winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
+    banRate:   banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
+    pickRate:  pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
+    tier:      tierFromWinRate(winRate),
+    _winRate:  winRate  || 0,
+    _banRate:  banRate  || 0,
+    _pickRate: pickRate || 0,
+  };
+}
+
+// ─── Fetch stats for ALL heroes ───────────────────────────────────────────────
+// The /hero-rank/ endpoint only returns 20 at a time, but accepts a
+// "main_heroid" filter to get stats for a specific hero.
+// We fetch all 131 hero IDs from /hero-list/, then query /hero-rank/
+// for each hero individually in batches.
+async function fetchAllHeroStats(heroIds) {
+  const statsMap = {};
+  const BATCH = 10; // parallel requests per batch
+  let fetched = 0;
+
+  console.log(`[API] Fetching rank stats for ${heroIds.length} heroes...`);
+
+  for (let i = 0; i < heroIds.length; i += BATCH) {
+    const batch = heroIds.slice(i, i + BATCH);
+
+    const results = await Promise.allSettled(
+      batch.map(id => post('/hero-rank/', { main_heroid: id }))
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j];
+      if (r.status !== 'fulfilled') continue;
+
+      const rows = r.value?.data?.records || [];
+      for (const row of rows) {
+        const stats = parseRankRow(row);
+        if (stats?.heroId) {
+          statsMap[stats.heroId] = stats;
+          fetched++;
+          break; // only need first match per hero
+        }
+      }
+    }
+
+    // Small delay between batches to be respectful
+    if (i + BATCH < heroIds.length) await new Promise(r => setTimeout(r, 150));
+  }
+
+  console.log(`[API] Got rank stats for ${fetched}/${heroIds.length} heroes`);
+  return statsMap;
+}
+
+// ─── Main hero stats fetch ────────────────────────────────────────────────────
 async function scrapeHeroStats() {
   console.log('[API] Fetching full hero roster from /hero-list/...');
 
   // Step 1: get complete roster from /hero-list/
-  // Confirmed shape: { data: { records: [ { data: { hero: { data: { head, name } }, hero_id, relation } } ] } }
-  const heroMap = {}; // heroId -> hero object
+  const heroMap = {};
 
   try {
     const raw  = await get('/hero-list/');
@@ -69,45 +130,28 @@ async function scrapeHeroStats() {
     console.error('[API] hero-list error:', e.message);
   }
 
-  // Step 2: overlay win/ban/pick stats from /hero-rank/ (top 20)
-  try {
-    const raw  = await post('/hero-rank/', {});
-    const rows = raw?.data?.records || [];
-    let overlaid = 0;
+  // Step 2: fetch rank stats for every hero individually
+  const heroIds = Object.keys(heroMap).map(Number);
+  const statsMap = await fetchAllHeroStats(heroIds);
 
-    for (const row of rows) {
-      const d        = row.data || row;
-      const heroData = d.main_hero?.data || {};
-      const heroId   = d.main_heroid;
-      const winRate  = d.main_hero_win_rate;
-      const banRate  = d.main_hero_ban_rate;
-      const pickRate = d.main_hero_appearance_rate;
-
-      if (!heroId) continue;
-
-      // Update existing entry or create new one
-      if (!heroMap[heroId]) {
-        heroMap[heroId] = {
-          name:     heroData.name || String(heroId),
-          role:     heroData.role || heroData.type || '—',
-          img:      heroData.head || '',
-          heroId,
-        };
-      }
-
-      heroMap[heroId].winRate  = winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—';
-      heroMap[heroId].banRate  = banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—';
-      heroMap[heroId].pickRate = pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—';
-      heroMap[heroId].tier     = tierFromWinRate(winRate);
-      heroMap[heroId]._winRate  = winRate  || 0;
-      heroMap[heroId]._banRate  = banRate  || 0;
-      heroMap[heroId]._pickRate = pickRate || 0;
-      overlaid++;
-    }
-    console.log(`[API] Overlaid stats on ${overlaid} heroes`);
-  } catch (e) {
-    console.error('[API] hero-rank error:', e.message);
+  // Step 3: merge stats into hero map
+  let merged = 0;
+  for (const [heroId, stats] of Object.entries(statsMap)) {
+    const id = Number(heroId);
+    if (!heroMap[id]) continue;
+    heroMap[id].winRate  = stats.winRate;
+    heroMap[id].banRate  = stats.banRate;
+    heroMap[id].pickRate = stats.pickRate;
+    heroMap[id].tier     = stats.tier;
+    heroMap[id]._winRate  = stats._winRate;
+    heroMap[id]._banRate  = stats._banRate;
+    heroMap[id]._pickRate = stats._pickRate;
+    // Use rank image if hero-list image is missing
+    if (!heroMap[id].img && stats.img) heroMap[id].img = stats.img;
+    merged++;
   }
+
+  console.log(`[API] Merged stats for ${merged}/${Object.keys(heroMap).length} heroes`);
 
   const heroes = Object.values(heroMap);
   console.log(`[API] Total heroes: ${heroes.length}`);
@@ -125,15 +169,12 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
 
   console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
-    // hero-detail returns { data: { records: [ { data: { head, head_big, hero: { data: {...} } } } ] } }
     const [detailRaw, counters, compatibility] = await Promise.allSettled([
       get(`/hero-detail/${heroId}/`),
       get(`/hero-counter/${heroId}/`),
       get(`/hero-compatibility/${heroId}/`),
     ]);
 
-    // Parse detail — confirmed shape from diagnostics:
-    // raw.data.records[0].data.hero.data -> hero attributes
     const detailRecords = detailRaw.value?.data?.records || [];
     const detailData    = detailRecords[0]?.data || {};
     const heroAttr      = detailData.hero?.data || {};
@@ -157,7 +198,6 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
       if (builds.length) build = (builds[0].items || builds[0].equipment || []).map(i => i.name || i.item_name).filter(Boolean);
     } catch {}
 
-    // Parse ability scores from abilityshow array [durability, offense, control, mobility] or similar
     const ability = heroAttr.abilityshow || [];
     const stats = {
       durability: parseInt(ability[0]) || heroAttr.durability || 0,
