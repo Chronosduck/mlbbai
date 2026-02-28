@@ -27,124 +27,91 @@ function tierFromWinRate(wr) {
   return 'C';
 }
 
-function parseHeroRow(row) {
-  try {
-    const d        = row.data || row;
-    const heroData = d.main_hero?.data || {};
-    const name     = heroData.name || heroData.hero_name;
-    if (!name) return null;
-
-    const winRate  = d.main_hero_win_rate;
-    const banRate  = d.main_hero_ban_rate;
-    const pickRate = d.main_hero_appearance_rate;
-
-    return {
-      name,
-      role:      heroData.role || heroData.type || heroData.hero_type || '—',
-      winRate:   winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—',
-      banRate:   banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—',
-      pickRate:  pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—',
-      tier:      tierFromWinRate(winRate),
-      img:       heroData.head || heroData.image || heroData.icon || '',
-      heroId:    d.main_heroid || heroData.id || null,
-      _winRate:  winRate  || 0,
-      _banRate:  banRate  || 0,
-      _pickRate: pickRate || 0,
-    };
-  } catch { return null; }
-}
-
-// ─── Diagnostics — run once on boot to understand API shapes ─────────────────
-let diagDone = false;
-async function runDiagnostics(knownId) {
-  if (diagDone) return;
-  diagDone = true;
-  console.log('\n[DIAG] ========== API DIAGNOSTIC ==========');
-
-  // 1. What does hero-detail look like for a known ID?
-  try {
-    const r = await get(`/hero-detail/${knownId}/`);
-    console.log(`[DIAG] hero-detail/${knownId} keys:`, Object.keys(r || {}));
-    console.log(`[DIAG] hero-detail/${knownId} full:`, JSON.stringify(r).slice(0, 800));
-  } catch(e) { console.log(`[DIAG] hero-detail/${knownId} ERROR:`, e.message); }
-
-  // 2. What does hero-detail look like for ID 1?
-  try {
-    const r = await get('/hero-detail/1/');
-    console.log('[DIAG] hero-detail/1 full:', JSON.stringify(r).slice(0, 400));
-  } catch(e) { console.log('[DIAG] hero-detail/1 ERROR:', e.message); }
-
-  // 3. Does the rank endpoint have a "list all" or "no pagination" mode?
-  try {
-    const r = await get('/hero-rank/?page_size=999&page=1&limit=999&offset=0&all=true');
-    const count = r?.data?.records?.length || r?.data?.data?.length || 0;
-    console.log('[DIAG] hero-rank all-params record count:', count);
-    console.log('[DIAG] hero-rank data keys:', Object.keys(r?.data || {}));
-  } catch(e) { console.log('[DIAG] hero-rank all-params ERROR:', e.message); }
-
-  // 4. Try hero-list endpoint
-  try {
-    const r = await get('/hero-list/');
-    console.log('[DIAG] hero-list full:', JSON.stringify(r).slice(0, 600));
-  } catch(e) { console.log('[DIAG] hero-list ERROR:', e.message); }
-
-  // 5. Try heroes endpoint
-  try {
-    const r = await get('/heroes/');
-    console.log('[DIAG] /heroes/ full:', JSON.stringify(r).slice(0, 600));
-  } catch(e) { console.log('[DIAG] /heroes/ ERROR:', e.message); }
-
-  // 6. Check the rank data keys to find total_count path
-  try {
-    const r = await post('/hero-rank/', {});
-    console.log('[DIAG] hero-rank POST empty body:', JSON.stringify(r).slice(0, 400));
-    if (r?.data) {
-      console.log('[DIAG] hero-rank data keys:', Object.keys(r.data));
-      console.log('[DIAG] hero-rank total fields:', JSON.stringify({
-        total_count: r.data.total_count,
-        count: r.data.count,
-        total: r.data.total,
-        num_pages: r.data.num_pages,
-        page_count: r.data.page_count,
-      }));
-    }
-  } catch(e) { console.log('[DIAG] hero-rank POST ERROR:', e.message); }
-
-  console.log('[DIAG] ==========================================\n');
-}
-
 // ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
+// /hero-list/ returns full roster (confirmed from diagnostics)
+// /hero-rank/ returns top 20 with win/ban/pick stats
+// We merge them: all heroes from hero-list, stats overlaid from hero-rank
 async function scrapeHeroStats() {
-  console.log('[API] Fetching hero rank list...');
+  console.log('[API] Fetching full hero roster from /hero-list/...');
 
-  const allHeroes = [];
-  const seenIds   = new Set();
+  // Step 1: get complete roster from /hero-list/
+  // Confirmed shape: { data: { records: [ { data: { hero: { data: { head, name } }, hero_id, relation } } ] } }
+  const heroMap = {}; // heroId -> hero object
 
+  try {
+    const raw  = await get('/hero-list/');
+    const rows = raw?.data?.records || [];
+    console.log(`[API] hero-list returned ${rows.length} heroes`);
+
+    for (const row of rows) {
+      const d      = row.data || row;
+      const hd     = d.hero?.data || {};
+      const name   = hd.name;
+      const heroId = d.hero_id;
+      if (!name || !heroId) continue;
+
+      heroMap[heroId] = {
+        name,
+        role:      hd.role || hd.type || hd.hero_type || '—',
+        winRate:   '—',
+        banRate:   '—',
+        pickRate:  '—',
+        tier:      'Unranked',
+        img:       hd.head || hd.image || hd.icon || '',
+        heroId,
+        _winRate:  0,
+        _banRate:  0,
+        _pickRate: 0,
+      };
+    }
+    console.log(`[API] Parsed ${Object.keys(heroMap).length} heroes from roster`);
+  } catch (e) {
+    console.error('[API] hero-list error:', e.message);
+  }
+
+  // Step 2: overlay win/ban/pick stats from /hero-rank/ (top 20)
   try {
     const raw  = await post('/hero-rank/', {});
     const rows = raw?.data?.records || [];
-
-    // Run diagnostics using first known hero ID
-    const firstId = rows[0]?.data?.main_heroid;
-    if (firstId) await runDiagnostics(firstId);
+    let overlaid = 0;
 
     for (const row of rows) {
-      const h = parseHeroRow(row);
-      if (!h?.heroId) continue;
-      if (seenIds.has(h.heroId)) continue;
-      seenIds.add(h.heroId);
-      allHeroes.push(h);
+      const d        = row.data || row;
+      const heroData = d.main_hero?.data || {};
+      const heroId   = d.main_heroid;
+      const winRate  = d.main_hero_win_rate;
+      const banRate  = d.main_hero_ban_rate;
+      const pickRate = d.main_hero_appearance_rate;
+
+      if (!heroId) continue;
+
+      // Update existing entry or create new one
+      if (!heroMap[heroId]) {
+        heroMap[heroId] = {
+          name:     heroData.name || String(heroId),
+          role:     heroData.role || heroData.type || '—',
+          img:      heroData.head || '',
+          heroId,
+        };
+      }
+
+      heroMap[heroId].winRate  = winRate  != null ? `${(winRate  * 100).toFixed(1)}%` : '—';
+      heroMap[heroId].banRate  = banRate  != null ? `${(banRate  * 100).toFixed(1)}%` : '—';
+      heroMap[heroId].pickRate = pickRate != null ? `${(pickRate * 100).toFixed(1)}%` : '—';
+      heroMap[heroId].tier     = tierFromWinRate(winRate);
+      heroMap[heroId]._winRate  = winRate  || 0;
+      heroMap[heroId]._banRate  = banRate  || 0;
+      heroMap[heroId]._pickRate = pickRate || 0;
+      overlaid++;
     }
-
-    const total = raw?.data?.total_count || raw?.data?.count || raw?.data?.total || '?';
-    console.log(`[API] Got ${allHeroes.length} heroes from rank (API total: ${total})`);
-
+    console.log(`[API] Overlaid stats on ${overlaid} heroes`);
   } catch (e) {
-    console.error('[API] Rank fetch error:', e.message);
+    console.error('[API] hero-rank error:', e.message);
   }
 
-  console.log(`[API] Total heroes: ${allHeroes.length}`);
-  return allHeroes;
+  const heroes = Object.values(heroMap);
+  console.log(`[API] Total heroes: ${heroes.length}`);
+  return heroes;
 }
 
 // ─── Single Hero Detail ───────────────────────────────────────────────────────
@@ -156,17 +123,23 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
   if (!heroId) { console.warn(`[API] No heroId for: ${heroIdOrSlug}`); return {}; }
 
+  console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
-    const [detail, counters, compatibility] = await Promise.allSettled([
+    // hero-detail returns { data: { records: [ { data: { head, head_big, hero: { data: {...} } } } ] } }
+    const [detailRaw, counters, compatibility] = await Promise.allSettled([
       get(`/hero-detail/${heroId}/`),
       get(`/hero-counter/${heroId}/`),
       get(`/hero-compatibility/${heroId}/`),
     ]);
 
-    const d    = detail.value?.data        || detail.value        || {};
+    // Parse detail — confirmed shape from diagnostics:
+    // raw.data.records[0].data.hero.data -> hero attributes
+    const detailRecords = detailRaw.value?.data?.records || [];
+    const detailData    = detailRecords[0]?.data || {};
+    const heroAttr      = detailData.hero?.data || {};
+
     const c    = counters.value?.data      || counters.value      || {};
     const comp = compatibility.value?.data || compatibility.value || {};
-    const dInner = d.data || d;
 
     function findArr(obj, depth = 0) {
       if (depth > 4) return null;
@@ -184,18 +157,22 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
       if (builds.length) build = (builds[0].items || builds[0].equipment || []).map(i => i.name || i.item_name).filter(Boolean);
     } catch {}
 
+    // Parse ability scores from abilityshow array [durability, offense, control, mobility] or similar
+    const ability = heroAttr.abilityshow || [];
+    const stats = {
+      durability: parseInt(ability[0]) || heroAttr.durability || 0,
+      offense:    parseInt(ability[1]) || heroAttr.offense    || 0,
+      control:    parseInt(ability[2]) || heroAttr.control    || 0,
+      mobility:   parseInt(ability[3]) || heroAttr.mobility   || 0,
+      support:    parseInt(ability[4]) || heroAttr.support    || 0,
+    };
+
     return {
-      name:        dInner.name || String(heroId),
-      role:        dInner.role || dInner.type || dInner.hero_type,
-      description: dInner.story || dInner.lore || dInner.description || '',
-      img:         dInner.head_image || dInner.image || dInner.head || dInner.avatar || '',
-      stats: {
-        durability: dInner.durability || 0,
-        offense:    dInner.offense    || 0,
-        control:    dInner.control    || 0,
-        mobility:   dInner.mobility   || 0,
-        support:    dInner.support    || 0,
-      },
+      name:        heroAttr.name || detailData.name || String(heroId),
+      role:        heroAttr.role || heroAttr.type   || heroAttr.hero_type || '—',
+      description: heroAttr.story || heroAttr.lore  || heroAttr.description || '',
+      img:         detailData.head_big || detailData.head || heroAttr.head || '',
+      stats,
       build,
       counters:  (findArr(c)    || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
       teammates: (findArr(comp) || []).map(h => h.name || h.hero_name || h).filter(x => typeof x === 'string'),
