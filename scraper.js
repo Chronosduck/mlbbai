@@ -1,20 +1,19 @@
-// scraper.js — Hero data from Moonton's official MLBB API (same source as mlbb-stats.ridwaanhall.com)
+// scraper.js — Hero data from mlbb-stats.ridwaanhall.com
 const axios = require('axios');
 
-// Wrapper API for detail/counter/compatibility endpoints
-const WRAPPER = 'https://mlbb-stats.ridwaanhall.com/api';
-// Moonton's official stats API (used by the in-game client and mlbb.gg)
-const MOONTON = 'https://mlbb-stats.ridwaanhall.com/api'; // fallback — try direct below
-
+const BASE = 'https://mlbb-stats.ridwaanhall.com/api';
 const HEADERS = { 'User-Agent': 'mlbbai-app/1.0' };
 
-async function get(base, path) {
-  const res = await axios.get(`${base}${path}`, { headers: HEADERS, timeout: 15000 });
+async function get(path) {
+  const res = await axios.get(`${BASE}${path}`, { headers: HEADERS, timeout: 15000 });
   return res.data;
 }
 
-async function post(base, path, body) {
-  const res = await axios.post(`${base}${path}`, body, { headers: { ...HEADERS, 'Content-Type': 'application/json' }, timeout: 15000 });
+async function post(path, body) {
+  const res = await axios.post(`${BASE}${path}`, body, {
+    headers: { ...HEADERS, 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
   return res.data;
 }
 
@@ -55,100 +54,94 @@ function parseHeroRow(row) {
   } catch { return null; }
 }
 
-// ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
-// Strategy: fetch pages 1..N using the wrapper, but each page independently
-// so duplicates are caught. The wrapper hardcaps at 20/page so we need 7 pages.
-async function scrapeHeroStats() {
-  console.log('[API] Fetching all heroes...');
-  const allHeroes = [];
-  const seenIds   = new Set();
+// Known MLBB hero IDs — Moonton assigns sequential IDs.
+// Heroes currently go from roughly ID 1 to ~150 (with gaps for unreleased/removed).
+// We scan all IDs and skip 404s.
+function knownHeroIds() {
+  const ids = [];
+  for (let i = 1; i <= 160; i++) ids.push(i);
+  return ids;
+}
 
-  // Try Moonton direct first (full page_size=126), fall back to wrapper pagination
+// Parse a hero-detail response into our standard hero shape
+function parseDetailAsHero(raw, heroId) {
   try {
-    const raw = await post(WRAPPER, '/hero-rank/', {
-      page_size:   126,
-      page_index:  1,
-      sorts_field: 'main_heroid',
-      sorts_order: 'desc',
-      day:         7,
-      rank:        'all',
-    });
+    const outer = raw?.data || raw;
+    const d     = outer?.data || outer;
+
+    const name = d.name || d.hero_name;
+    if (!name) return null;
+
+    return {
+      name,
+      role:      d.role || d.type || d.hero_type || '—',
+      winRate:   '—',
+      banRate:   '—',
+      pickRate:  '—',
+      tier:      'Unranked',
+      img:       d.head || d.head_image || d.image || d.icon || d.avatar || '',
+      heroId,
+      _winRate:  0,
+      _banRate:  0,
+      _pickRate: 0,
+    };
+  } catch { return null; }
+}
+
+// ─── Fetch ALL heroes ─────────────────────────────────────────────────────────
+async function scrapeHeroStats() {
+  console.log('[API] Fetching hero rank list (page 1)...');
+
+  // Step 1: get rank stats for the top 20 from the rank endpoint
+  const rankMap = {}; // heroId -> rank stats
+  try {
+    const raw  = await post('/hero-rank/', { page_size: 20, page_index: 1 });
     const rows = raw?.data?.records || [];
-    if (rows.length > 20) {
-      // Direct large-page worked
-      rows.forEach(row => {
-        const hero = parseHeroRow(row);
-        if (!hero) return;
-        const key = hero.heroId || hero.name;
-        if (seenIds.has(key)) return;
-        seenIds.add(key);
-        allHeroes.push(hero);
-      });
-      console.log(`[API] Got ${allHeroes.length} heroes (single request)`);
-      return allHeroes;
+    for (const row of rows) {
+      const h = parseHeroRow(row);
+      if (h?.heroId) rankMap[h.heroId] = h;
     }
+    console.log(`[API] Got rank stats for ${Object.keys(rankMap).length} heroes`);
   } catch (e) {
-    console.log('[API] Large-page attempt failed, falling back to pagination:', e.message);
+    console.error('[API] Rank fetch failed:', e.message);
   }
 
-  // Fallback: iterate pages using wrapper (20/page) with different sort each batch
-  // to get different slices. The wrapper sorts by ban_rate desc by default.
-  // We fetch sorted by win_rate, ban_rate, pick_rate, and heroid to maximize coverage.
-  const sortFields = [
-    { sorts_field: 'main_hero_ban_rate',        sorts_order: 'desc' },
-    { sorts_field: 'main_hero_win_rate',        sorts_order: 'desc' },
-    { sorts_field: 'main_hero_appearance_rate', sorts_order: 'desc' },
-    { sorts_field: 'main_hero_ban_rate',        sorts_order: 'asc'  },
-    { sorts_field: 'main_hero_win_rate',        sorts_order: 'asc'  },
-    { sorts_field: 'main_hero_appearance_rate', sorts_order: 'asc'  },
-    { sorts_field: 'main_heroid',               sorts_order: 'desc' },
-  ];
+  // Step 2: scan all known hero IDs via the detail endpoint to get full roster
+  // Batch requests in groups of 10 to avoid overwhelming the API
+  const allHeroes = [];
+  const seenIds   = new Set(Object.keys(rankMap).map(Number));
 
-  for (const sort of sortFields) {
-    try {
-      const raw  = await post(WRAPPER, '/hero-rank/', { page_size: 20, page_index: 1, ...sort });
-      const rows = raw?.data?.records || [];
-      let added = 0;
-      for (const row of rows) {
-        const hero = parseHeroRow(row);
-        if (!hero) continue;
-        const key = hero.heroId || hero.name;
-        if (seenIds.has(key)) continue;
-        seenIds.add(key);
-        allHeroes.push(hero);
-        added++;
-      }
-      console.log(`[API] Sort ${sort.sorts_field} ${sort.sorts_order}: +${added} new (total: ${allHeroes.length})`);
-    } catch (e) {
-      console.error('[API] Sort fetch failed:', e.message);
+  // First add the rank heroes (they have full stats)
+  Object.values(rankMap).forEach(h => allHeroes.push(h));
+
+  const ids      = knownHeroIds().filter(id => !seenIds.has(id));
+  const BATCH    = 10;
+  let found      = 0;
+
+  console.log(`[API] Scanning ${ids.length} hero IDs for remaining heroes...`);
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch   = ids.slice(i, i + BATCH);
+    const results = await Promise.allSettled(
+      batch.map(id => get(`/hero-detail/${id}/`))
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j];
+      if (r.status !== 'fulfilled') continue;
+      const hero = parseDetailAsHero(r.value, batch[j]);
+      if (!hero) continue;
+      allHeroes.push(hero);
+      seenIds.add(batch[j]);
+      found++;
     }
+
+    // Small delay to be respectful to the API
+    if (i + BATCH < ids.length) await new Promise(r => setTimeout(r, 200));
   }
 
-  // Also try rank filters to get heroes that might only appear in certain brackets
-  const rankFilters = ['epic', 'legend', 'mythic', 'honor', 'glory'];
-  for (const rank of rankFilters) {
-    try {
-      const raw  = await post(WRAPPER, '/hero-rank/', {
-        page_size:   20, page_index: 1,
-        sorts_field: 'main_hero_ban_rate', sorts_order: 'desc',
-        rank,
-      });
-      const rows = raw?.data?.records || [];
-      let added = 0;
-      for (const row of rows) {
-        const hero = parseHeroRow(row);
-        if (!hero) continue;
-        const key = hero.heroId || hero.name;
-        if (seenIds.has(key)) continue;
-        seenIds.add(key);
-        allHeroes.push(hero);
-        added++;
-      }
-      if (added > 0) console.log(`[API] Rank ${rank}: +${added} new (total: ${allHeroes.length})`);
-    } catch {}
-  }
-
-  console.log(`[API] Total heroes fetched: ${allHeroes.length}`);
+  console.log(`[API] ID scan complete: +${found} additional heroes`);
+  console.log(`[API] Total heroes: ${allHeroes.length}`);
   return allHeroes;
 }
 
@@ -159,15 +152,14 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
     const match = allHeroes.find(h => h.name?.toLowerCase() === String(heroIdOrSlug).toLowerCase());
     heroId = match?.heroId || null;
   }
-
   if (!heroId) { console.warn(`[API] No heroId for: ${heroIdOrSlug}`); return {}; }
 
   console.log(`[API] Fetching detail heroId: ${heroId}`);
   try {
     const [detail, counters, compatibility] = await Promise.allSettled([
-      get(WRAPPER, `/hero-detail/${heroId}/`),
-      get(WRAPPER, `/hero-counter/${heroId}/`),
-      get(WRAPPER, `/hero-compatibility/${heroId}/`),
+      get(`/hero-detail/${heroId}/`),
+      get(`/hero-counter/${heroId}/`),
+      get(`/hero-compatibility/${heroId}/`),
     ]);
 
     const d    = detail.value?.data        || detail.value        || {};
@@ -186,7 +178,7 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
 
     let build = [];
     try {
-      const guide  = await get(WRAPPER, `/academy/guide/${heroId}/builds/`);
+      const guide  = await get(`/academy/guide/${heroId}/builds/`);
       const builds = findArr(guide) || [];
       if (builds.length) build = (builds[0].items || builds[0].equipment || []).map(i => i.name || i.item_name).filter(Boolean);
     } catch {}
@@ -213,10 +205,8 @@ async function scrapeHeroDetail(heroIdOrSlug, allHeroes = []) {
   }
 }
 
-// ─── Tier List & Leaderboard (derived from hero stats) ───────────────────────
+// ─── Tier List & Leaderboard ──────────────────────────────────────────────────
 async function scrapeTierList() {
-  // Called by server.js only during boot — server.js now calls scrapeHeroStats() once
-  // and derives tier list itself, so this is just a thin wrapper
   const heroes = await scrapeHeroStats();
   const tiers  = {};
   heroes.forEach(h => {
