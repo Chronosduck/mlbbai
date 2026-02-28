@@ -1,165 +1,131 @@
-// scraper.js — Lightweight scraper using axios + cheerio (no Chrome/Puppeteer)
-const axios   = require('axios');
-const cheerio = require('cheerio');
+// scraper.js — Uses free MLBB Stats API (mlbb-stats.rone.dev)
+// No scraping needed — real live data from a public API
+const axios = require('axios');
 
-const BASE    = 'https://mlbb.gg';
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.5',
-};
+const BASE = 'https://mlbb-stats.rone.dev/api';
+const HEADERS = { 'User-Agent': 'mlbbai-app/1.0' };
 
-async function fetchHTML(url) {
-  const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+async function get(path) {
+  const res = await axios.get(`${BASE}${path}`, { headers: HEADERS, timeout: 15000 });
   return res.data;
 }
 
-// ─── Hero List + Win/Ban/Pick Rates ──────────────────────────────────────────
+// ─── Hero List with win/ban/pick rates ────────────────────────────────────────
 async function scrapeHeroStats() {
-  console.log('[SCRAPER] Fetching hero stats...');
+  console.log('[API] Fetching hero rank list...');
   try {
-    const html = await fetchHTML(`${BASE}/heroes`);
-    const $    = cheerio.load(html);
-    const heroes = [];
+    const data = await get('/hero-rank/');
+    const rows = data?.data || data?.results || data || [];
 
-    // Try card layout
-    $('[class*="hero-card"], [class*="HeroCard"], [class*="hero_card"]').each((i, el) => {
-      const name = $(el).find('[class*="name"], h3, h2').first().text().trim();
-      const role = $(el).find('[class*="role"], [class*="class"]').first().text().trim();
-      const wr   = $(el).find('[class*="winrate"], [class*="win-rate"]').first().text().trim();
-      const br   = $(el).find('[class*="banrate"], [class*="ban-rate"]').first().text().trim();
-      const pr   = $(el).find('[class*="pickrate"], [class*="pick-rate"]').first().text().trim();
-      const tier = $(el).find('[class*="tier"]').first().text().trim();
-      const img  = $(el).find('img').first().attr('src') || '';
-      if (name) heroes.push({ name, role, winRate: wr, banRate: br, pickRate: pr, tier, img });
-    });
+    const heroes = rows.map(h => ({
+      name:      h.name || h.hero_name,
+      role:      h.role || h.type || h.lane,
+      winRate:   h.win_rate   ? `${(h.win_rate * 100).toFixed(1)}%`   : (h.winRate || '—'),
+      banRate:   h.ban_rate   ? `${(h.ban_rate * 100).toFixed(1)}%`   : (h.banRate || '—'),
+      pickRate:  h.pick_rate  ? `${(h.pick_rate * 100).toFixed(1)}%`  : (h.pickRate || '—'),
+      tier:      h.tier || h.rank || '—',
+      img:       h.image || h.icon || h.head_image || '',
+      heroId:    h.hero_id || h.id || null,
+    })).filter(h => h.name);
 
-    // Fallback: table rows
-    if (heroes.length === 0) {
-      $('table tbody tr').each((i, el) => {
-        const cells = $(el).find('td');
-        const name  = cells.eq(0).text().trim() || cells.eq(1).text().trim();
-        const role  = cells.eq(1).text().trim();
-        const wr    = cells.eq(2).text().trim();
-        const br    = cells.eq(3).text().trim();
-        const pr    = cells.eq(4).text().trim();
-        if (name && name.length > 1) heroes.push({ name, role, winRate: wr, banRate: br, pickRate: pr });
-      });
-    }
-
-    // Fallback: JSON in script tags (many modern sites embed data as JSON)
-    if (heroes.length === 0) {
-      $('script').each((i, el) => {
-        const src = $(el).html() || '';
-        const match = src.match(/"heroes"\s*:\s*(\[.*?\])/s) ||
-                      src.match(/window\.__NUXT__\s*=\s*(\{.*\})/s);
-        if (match) {
-          try {
-            const raw = JSON.parse(match[1]);
-            (Array.isArray(raw) ? raw : []).forEach(h => {
-              if (h.name) heroes.push({
-                name: h.name, role: h.role || h.type,
-                winRate: h.win_rate || h.winRate,
-                banRate: h.ban_rate || h.banRate,
-                pickRate: h.pick_rate || h.pickRate,
-                tier: h.tier, img: h.image || h.img
-              });
-            });
-          } catch {}
-        }
-      });
-    }
-
-    console.log(`[SCRAPER] Found ${heroes.length} heroes`);
+    console.log(`[API] Got ${heroes.length} heroes`);
     return heroes;
   } catch (err) {
-    console.error('[SCRAPER] Hero stats error:', err.message);
+    console.error('[API] Hero list error:', err.message);
     return [];
   }
 }
 
 // ─── Single Hero Detail ───────────────────────────────────────────────────────
 async function scrapeHeroDetail(slug) {
-  console.log(`[SCRAPER] Hero detail: ${slug}`);
+  console.log(`[API] Fetching detail: ${slug}`);
   try {
-    const html = await fetchHTML(`${BASE}/heroes/${slug}`);
-    const $    = cheerio.load(html);
-    const stats = {}, build = [], skills = [], counters = [];
+    const [detail, stats, counters, compatibility] = await Promise.allSettled([
+      get(`/hero-detail/${slug}/`),
+      get(`/hero-detail-stats/${slug}/`),
+      get(`/hero-counter/${slug}/`),
+      get(`/hero-compatibility/${slug}/`),
+    ]);
 
-    $('[class*="stat-item"], [class*="attribute"]').each((i, el) => {
-      const label = $(el).find('[class*="label"], [class*="name"]').text().trim().toLowerCase();
-      const value = $(el).find('[class*="value"], [class*="val"]').text().trim();
-      if (label) stats[label] = value;
-    });
+    const d = detail.value?.data || detail.value || {};
+    const s = stats.value?.data  || stats.value  || {};
+    const c = counters.value?.data || counters.value || {};
+    const comp = compatibility.value?.data || compatibility.value || {};
 
-    $('[class*="build"] [class*="item"], [class*="recommended"] [class*="item"]').each((i, el) => {
-      const name = $(el).find('[class*="name"]').text().trim() || $(el).attr('alt');
-      if (name) build.push(name);
-    });
+    // Build recommended items from academy
+    let build = [];
+    try {
+      const guide = await get(`/academy/guide/${slug}/builds/`);
+      const builds = guide?.data || guide?.results || [];
+      if (builds.length) {
+        const top = builds[0];
+        build = (top.items || top.equipment || []).map(i => i.name || i.item_name).filter(Boolean);
+      }
+    } catch {}
 
-    $('[class*="skill"], [class*="ability"]').each((i, el) => {
-      const name = $(el).find('[class*="name"]').text().trim();
-      const desc = $(el).find('[class*="desc"], p').first().text().trim();
-      if (name) skills.push({ name, desc });
-    });
-
-    $('[class*="counter"] [class*="hero"]').each((i, el) => {
-      const name = $(el).find('[class*="name"]').text().trim();
-      if (name) counters.push(name);
-    });
-
-    return { stats, build, skills, counters };
+    return {
+      name:        d.name || slug,
+      role:        d.role || d.type,
+      description: d.story || d.lore || d.description || '',
+      img:         d.head_image || d.image || '',
+      stats: {
+        durability: s.durability || 0,
+        offense:    s.offense    || 0,
+        control:    s.control    || 0,
+        mobility:   s.mobility   || 0,
+        support:    s.support    || 0,
+      },
+      build,
+      counters:    (c.counters   || c.counter_heroes || []).map(h => h.name || h).filter(Boolean),
+      teammates:   (comp.teammates || comp.best_partners || []).map(h => h.name || h).filter(Boolean),
+    };
   } catch (err) {
-    console.error(`[SCRAPER] Detail error (${slug}):`, err.message);
+    console.error(`[API] Detail error (${slug}):`, err.message);
     return {};
   }
 }
 
 // ─── Tier List ────────────────────────────────────────────────────────────────
 async function scrapeTierList() {
-  console.log('[SCRAPER] Fetching tier list...');
+  console.log('[API] Fetching tier list...');
   try {
-    const html = await fetchHTML(`${BASE}/tier-list`);
-    const $    = cheerio.load(html);
+    const data = await get('/hero-rank/');
+    const rows = data?.data || data?.results || data || [];
     const tiers = {};
 
-    $('[class*="tier-row"], [class*="TierRow"], [class*="tier-group"]').each((i, el) => {
-      const label  = $(el).find('[class*="tier-label"], [class*="rank"]').first().text().trim();
-      const heroes = [];
-      $(el).find('[class*="hero"], [class*="champion"]').each((j, h) => {
-        const name = $(h).find('[class*="name"]').text().trim() || $(h).attr('alt');
-        if (name) heroes.push(name);
-      });
-      if (label && heroes.length) tiers[label] = heroes;
+    rows.forEach(h => {
+      const tier = h.tier || h.rank || 'Unranked';
+      if (!tiers[tier]) tiers[tier] = [];
+      tiers[tier].push(h.name || h.hero_name);
     });
 
+    console.log(`[API] Tier groups: ${Object.keys(tiers).length}`);
     return tiers;
   } catch (err) {
-    console.error('[SCRAPER] Tier list error:', err.message);
+    console.error('[API] Tier list error:', err.message);
     return {};
   }
 }
 
 // ─── Leaderboard ─────────────────────────────────────────────────────────────
 async function scrapeLeaderboard() {
-  console.log('[SCRAPER] Fetching leaderboard...');
+  console.log('[API] Fetching leaderboard...');
   try {
-    const html    = await fetchHTML(`${BASE}/leaderboard`);
-    const $       = cheerio.load(html);
-    const players = [];
+    const data = await get('/mplid/player-stats/');
+    const rows = data?.data || data?.results || data || [];
 
-    $('table tbody tr, [class*="leaderboard"] [class*="row"]').each((i, el) => {
-      const rank   = $(el).find('td:nth-child(1)').text().trim();
-      const name   = $(el).find('td:nth-child(2), [class*="name"]').first().text().trim();
-      const server = $(el).find('td:nth-child(3), [class*="server"]').first().text().trim();
-      const points = $(el).find('td:nth-child(4), [class*="points"]').first().text().trim();
-      const hero   = $(el).find('[class*="hero"]').first().text().trim();
-      if (name) players.push({ rank, name, server, points, hero });
-    });
+    const players = rows.map((p, i) => ({
+      rank:   p.rank || i + 1,
+      name:   p.player_name || p.name,
+      server: p.team || p.server || '—',
+      points: p.rating || p.points || p.kda || '—',
+      hero:   p.most_used_hero || p.hero || '—',
+    })).filter(p => p.name);
 
+    console.log(`[API] Players: ${players.length}`);
     return players.slice(0, 100);
   } catch (err) {
-    console.error('[SCRAPER] Leaderboard error:', err.message);
+    console.error('[API] Leaderboard error:', err.message);
     return [];
   }
 }
